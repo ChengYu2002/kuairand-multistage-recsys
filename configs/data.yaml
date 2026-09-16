@@ -1,34 +1,61 @@
-# 数据与切分配置。日期在 EDA 之后再填，不提前写死（见 plan §6.1）。
+# 数据与切分配置。所有取值来自 results/schema_report.md（scripts/inspect_schema.py 产出）。
 dataset:
   name: KuaiRand-1K        # dev: KuaiRand-1K / main: KuaiRand-27K
-  raw_dir: data/raw
+  raw_dir: data/raw/KuaiRand-1K/data
   processed_dir: data/processed
   cache_dir: data/cache
+  log_standard: "log_standard_*.csv"   # glob：27K 的日志是分片的
+  log_random: "log_random_*.csv"       # §29 robustness check，覆盖 0422~0508
 
 sampling:
   unit: user               # 必须按用户抽样，禁止按行随机抽样
-  n_users: null            # 27K 主实验: 2000-3000
+  n_users: null            # 1K 全量使用；27K 主实验填 2000-3000
   seed: 42
 
-split:                     # Global Temporal Split: train < val < test
-  train_end: null
-  valid_end: null
-  test_end: null
+# Global Temporal Split（plan §6）：max(train) < min(val) < min(test)
+# 数据共 31 天（20220408~20220508），日曝光稳定在 33~44 万，无异常日需避开。
+split:
+  warmup_end: 20220414     # 前 7 天仅供 T-1 特征预热，不产出训练样本（§8.2 有 7 天窗口）
+  train_end:  20220430     # 449.5 万曝光（tab 1/2/4）
+  valid_end:  20220504
+  test_end:   20220508     # 123.4 万曝光，54.9 万正向事件 = retrieval request
+
+# Scene / Tab 语义（plan §10.1）
+# 官方文档：is_click 在双列 UI 下是点击，单列 UI 下等价于 valid_play。
+# 实测 P(long_view|click)：tab 0 = 0.33，tab 1/2/4 = 0.71~0.76 —— 语义确实不同。
+# tab 3/5/6/7/8/9/10/11/12/13/14 合计 < 2%，且部分退化（tab 14 的 is_click 恒为 0）。
+scene:
+  tab_whitelist: [1, 2, 4]   # 901.5 万行，占全量 77.0%
+  holdout_tabs: [0]          # 20.6%，单独作为 robustness 报告，不混入主实验
 
 history:
   max_len: 50              # recent_click_items_N
-  positive_signal: [click, long_view]
+  positive_signal: [is_click, long_view]
 
 features:
   snapshot: T-1            # Day T 样本只允许使用 <= T-1 的聚合
   windows: [1, 3, 7]
+  tag_is_multivalue: true  # tag 为逗号分隔，24.7% 的视频有多个 tag，需 multi-hot
+  upload_dt_has_time: false  # 仅日期粒度 -> 候选库用 upload_date < request_date（§14.1）
 
+# 正样本率实测（限定 tab 1/2/4，共 901.5 万行）
 labels:
-  tasks: [click, long_view, like, follow, comment]
+  tasks: [is_click, long_view, is_like, is_comment, is_follow]
+  positive_rate:
+    is_click:   0.45439    # 4,096,495
+    long_view:  0.32738    # 2,951,420
+    is_like:    0.01895    #   170,852
+    is_comment: 0.00322    #    29,004
+    is_follow:  0.00115    #    10,341  <- 测试窗约 1,400 正样本，AUC 的 seed 方差会很大，必须报 std
+  excluded: [is_forward, is_hate]   # 不在 plan §10 清单内，且极稀疏
 
 leakage:
-  forbidden_fields:        # 只能作为 label / 分析对象，不得作为输入
+  forbidden_fields:        # 曝光后才产生，只能当 label / 分析对象（§7.1）
     - play_time_ms
     - profile_stay_time
     - comment_stay_time
     - is_profile_enter
+  # duration_ms 不是泄漏：视频时长在曝光前已知，可作为特征。
+  # video_features_statistic_*.csv 全表禁用：官方说明其为「整月每日平均」，
+  # 对任一天的样本都含未来信息（§7.2）。物品统计特征一律从 past-only 日志自建。
+  excluded_files: [video_features_statistic]
