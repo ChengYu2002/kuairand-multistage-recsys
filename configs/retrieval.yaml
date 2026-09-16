@@ -1,0 +1,29 @@
+# Two-Tower / ItemCF 召回。负采样对比必须固定除策略外的所有变量（plan §16.6）。
+two_tower:
+  embedding_dim: 64
+  user_tower_hidden: [256, 128, 64]
+  item_tower_hidden: [256, 128, 64]
+  item_tower_config: id_only     # id_only | id_side
+  optimizer: adam
+  lr: 0.001
+  batch_size: 1024
+  epochs: 5
+  negatives_per_positive: 10
+
+negative_sampling:
+  strategy: random               # random | inbatch | exposure | hybrid
+  hybrid_mix: {random: 0.5, exposure: 0.5}
+  logq_correction: false         # P1
+
+itemcf:
+  similarity: normalized_cooccurrence
+  topk_similar: 100
+  topk_recall: 500
+
+catalog:
+  protocol: A                    # A = warm catalog, B = time-aware available
+  upload_rule: strict_before     # upload_date < request_date
+
+eval:
+  k_list: [50, 100, 500]
+  request_unit: positive_event   # 测试窗内每个正向事件 = 一个 request

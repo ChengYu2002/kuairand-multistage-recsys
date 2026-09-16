@@ -1,0 +1,4 @@
+# DIN-style attention (P2，默认不做)。
+enabled: false
+attention_hidden: [64, 32]
+max_history_len: 50

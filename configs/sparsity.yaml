@@ -1,0 +1,5 @@
+# Controlled Label Sparsity (plan §11)：只改变可用正向训练信号。
+task: click                    # click 或 long_view
+levels: [1.0, 0.1, 0.01, 0.001]
+method: positive_row_downsample   # 正样本整行下采样，不是翻转成负样本
+seeds: [42, 43, 44]

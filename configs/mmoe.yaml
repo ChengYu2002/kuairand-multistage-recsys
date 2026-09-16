@@ -1,0 +1,14 @@
+# MMoE：共享专家 + 每任务门控。
+
+data_config: configs/data.yaml
+tasks: [click, long_view, like, follow, comment]
+embedding_dim: 32
+optimizer: adam
+lr: 0.001
+batch_size: 2048
+epochs: 5
+seeds: [42, 43, 44]        # 最终实验必须 3 seeds，报告 mean ± std
+
+n_experts: 8
+expert_hidden: [256, 128]
+tower_hidden: [64]

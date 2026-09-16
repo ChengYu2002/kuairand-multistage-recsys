@@ -1,0 +1,34 @@
+# 数据与切分配置。日期在 EDA 之后再填，不提前写死（见 plan §6.1）。
+dataset:
+  name: KuaiRand-1K        # dev: KuaiRand-1K / main: KuaiRand-27K
+  raw_dir: data/raw
+  processed_dir: data/processed
+  cache_dir: data/cache
+
+sampling:
+  unit: user               # 必须按用户抽样，禁止按行随机抽样
+  n_users: null            # 27K 主实验: 2000-3000
+  seed: 42
+
+split:                     # Global Temporal Split: train < val < test
+  train_end: null
+  valid_end: null
+  test_end: null
+
+history:
+  max_len: 50              # recent_click_items_N
+  positive_signal: [click, long_view]
+
+features:
+  snapshot: T-1            # Day T 样本只允许使用 <= T-1 的聚合
+  windows: [1, 3, 7]
+
+labels:
+  tasks: [click, long_view, like, follow, comment]
+
+leakage:
+  forbidden_fields:        # 只能作为 label / 分析对象，不得作为输入
+    - play_time_ms
+    - profile_stay_time
+    - comment_stay_time
+    - is_profile_enter

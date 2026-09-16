@@ -1,0 +1,16 @@
+# PLE：共享专家 + 任务专属专家。
+
+data_config: configs/data.yaml
+tasks: [click, long_view, like, follow, comment]
+embedding_dim: 32
+optimizer: adam
+lr: 0.001
+batch_size: 2048
+epochs: 5
+seeds: [42, 43, 44]        # 最终实验必须 3 seeds，报告 mean ± std
+
+n_levels: 2
+n_shared_experts: 4
+n_task_experts: 2
+expert_hidden: [256, 128]
+tower_hidden: [64]

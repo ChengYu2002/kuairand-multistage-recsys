@@ -1,0 +1,9 @@
+# LightGBM 粗排 (P1)。
+objective: binary
+num_leaves: 63
+learning_rate: 0.05
+n_estimators: 500
+min_child_samples: 100
+feature_fraction: 0.8
+bagging_fraction: 0.8
+early_stopping_rounds: 50
