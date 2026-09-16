@@ -4,6 +4,9 @@ data/processed/*
 data/cache/*
 !data/**/.gitkeep
 
+# Papers / reading material (版权原因不入库)
+literatures/
+
 # Experiment outputs
 experiments/*
 results/*
