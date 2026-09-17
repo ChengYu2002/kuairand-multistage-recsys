@@ -5,7 +5,13 @@
   2. 丢弃 `leakage.forbidden_fields` —— 曝光后产物不进入建模表，从物理上杜绝误用。
      如需做 post-hoc 分析，请回原始 CSV 读取。
   3. 收窄 dtype（int64 -> int8/int32），大幅减小体积与后续内存占用。
-  4. 落盘 Parquet：列式 + 压缩 + 带类型，后续每一步都不必再解析 CSV。
+  4. 由 time_ms 重算 `date`，使日期与时间戳构造上一致（见下）。
+  5. 落盘 Parquet：列式 + 压缩 + 带类型，后续每一步都不必再解析 CSV。
+
+关于 date 的重算：原始 `date` 列把 23 点之后的记录算作第二天（实测 9,015,279 行中
+有 57,340 行如此，占 0.64%，且 100% 发生在 23 点）。这个偏差方向一致，本身不产生
+泄漏，但会让「Day T 的样本只用 <= T-1 的聚合」这句话失去唯一解释——而特征泄漏是
+静默的。因此统一以 time_ms（UTC）加时区偏移重算日期，原始值保留为 `date_raw` 备查。
 
 用法：
     python -m src.preprocessing.preprocess --config configs/data.yaml
@@ -34,6 +40,18 @@ NARROW = {
     "is_rand": pl.Int8,
 }
 LABEL_COLS = ["is_click", "long_view", "is_like", "is_follow", "is_comment", "is_forward", "is_hate"]
+
+
+def _rebuild_date(lf: pl.LazyFrame, offset_hours: int) -> pl.LazyFrame:
+    """用 time_ms 重算本地日期；保留原始值为 date_raw。"""
+    cols = set(lf.collect_schema().keys())
+    if not {"date", "time_ms"} <= cols:
+        return lf
+    local = pl.from_epoch("time_ms", time_unit="ms") + pl.duration(hours=offset_hours)
+    return lf.with_columns(pl.col("date").alias("date_raw")).with_columns(
+        local.dt.strftime("%Y%m%d").cast(pl.Int32).alias("date"),
+        (local.dt.hour().cast(pl.Int16) * 100 + local.dt.minute().cast(pl.Int16)).alias("hourmin"),
+    )
 
 
 def _narrow(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -74,7 +92,8 @@ def main() -> int:
     holdout = cfg.get("scene", {}).get("holdout_tabs", [])
     forbidden = cfg.get("leakage", {}).get("forbidden_fields", [])
 
-    logs = _narrow(_scan(raw_dir, require(cfg, "dataset", "log_standard")))
+    tz = require(cfg, "split", "timezone_offset_hours")
+    logs = _rebuild_date(_narrow(_scan(raw_dir, require(cfg, "dataset", "log_standard"))), tz)
     present = set(logs.collect_schema().keys())
     drop = [c for c in forbidden if c in present]
     if drop:
@@ -89,7 +108,7 @@ def main() -> int:
 
     rnd = cfg.get("dataset", {}).get("log_random")
     if rnd:
-        r = _narrow(_scan(raw_dir, rnd))
+        r = _rebuild_date(_narrow(_scan(raw_dir, rnd)), tz)
         r = r.drop([c for c in forbidden if c in set(r.collect_schema().keys())])
         _write(r, out_dir / "logs_random.parquet", "随机曝光")
 

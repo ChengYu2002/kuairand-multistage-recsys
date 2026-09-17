@@ -6,8 +6,8 @@
 当前覆盖：
   1. 曝光后字段（§7.1）未出现在建模表中
   2. 官方整月统计文件（§7.2）未被物化进 processed/
-  3. 时间切分严格有序（§6.2）
-  4. 各 split 的时间区间互不重叠
+  3. date 列与 time_ms 构造上一致（原始 date 把 23 点记为第二天）
+  4. 时间切分严格有序（§6.2）
 
 特征管线完成后，这里还应加入「Day T 样本只使用 <= T-1 的聚合」的校验。
 
@@ -57,7 +57,31 @@ def main() -> int:
             failures.append(f"被禁用的统计文件已进入 processed/: {[h.name for h in hits]}")
     log.info("OK  官方整月统计文件未物化")
 
-    # 3 & 4. 时间切分
+    # 3. date 与 time_ms 一致性 —— T-1 特征的「Day T 只用 <= T-1」依赖这一点
+    tz = cfg.get("split", {}).get("timezone_offset_hours")
+    if tz is not None:
+        for name in ("logs_main.parquet", "logs_split.parquet", "logs_random.parquet"):
+            f = proc / name
+            if not f.is_file():
+                continue
+            n_bad = (
+                pl.scan_parquet(f)
+                .filter(
+                    pl.col("date")
+                    != (pl.from_epoch("time_ms", time_unit="ms") + pl.duration(hours=tz))
+                    .dt.strftime("%Y%m%d")
+                    .cast(pl.Int32)
+                )
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+            if n_bad:
+                failures.append(f"{name} 有 {n_bad:,} 行的 date 与 time_ms 不符")
+            else:
+                log.info("OK  %-22s date 与 time_ms 一致", name)
+
+    # 4. 时间切分
     split_file = proc / "logs_split.parquet"
     if not split_file.is_file():
         failures.append("logs_split.parquet 不存在，请先运行 temporal_split")
