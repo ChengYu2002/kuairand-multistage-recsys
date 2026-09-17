@@ -15,6 +15,10 @@ sampling:
 # Global Temporal Split（plan §6）：max(train) < min(val) < min(test)
 # 数据共 31 天（20220408~20220508），日曝光稳定在 33~44 万，无异常日需避开。
 split:
+  # 实测：date 是北京时间(UTC+8)，time_ms 是 UTC；两者在跨零点处有 0.52% 不一致。
+  # 因此切分按 time_ms 执行（时间戳才是真实顺序），下面的日期是 UTC+8 下的边界，
+  # 每段包含该日 23:59:59.999 之前的全部记录。这样 §6.2 的 max(train)<min(valid) 是构造上成立的。
+  timezone_offset_hours: 8
   warmup_end: 20220414     # 前 7 天仅供 T-1 特征预热，不产出训练样本（§8.2 有 7 天窗口）
   train_end:  20220430     # 449.5 万曝光（tab 1/2/4）
   valid_end:  20220504
