@@ -13,4 +13,5 @@ from __future__ import annotations
 from src.features._driver import build
 
 if __name__ == "__main__":
+    # 执行完里面的任务后，结束当前 Python 程序，并把结果作为退出状态码返回
     raise SystemExit(build("user_id", "user", "feat_user_daily.parquet", __name__))

@@ -35,3 +35,6 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# Personal learning notes
+/note/

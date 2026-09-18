@@ -3,7 +3,7 @@
 > Industrial-style multi-objective short-video recommendation system built on KuaiRand:
 > global temporal splitting, T-1 feature snapshots, two-tower retrieval, and multi-task ranking.
 
-**状态：🚧 骨架搭建中（Week 1）。** 完整设计见 [plan_architecture.md](plan_architecture.md)。
+**状态：🚧 骨架搭建中（Week 1）。** 完整设计见本地个人笔记 `note/plan_architecture.md`（不入库）。
 
 ---
 
