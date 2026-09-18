@@ -35,6 +35,7 @@ def main() -> int:
     args = ap.parse_args()
     cfg = load_config(args.config)
     proc = project_path(require(cfg, "dataset", "processed_dir"))
+    # 不在第一个错误处停止；一次收集全部问题，方便集中修复。
     failures: list[str] = []
 
     # 1. 曝光后字段
@@ -43,6 +44,7 @@ def main() -> int:
         f = proc / name
         if not f.is_file():
             continue
+        # 这里只读取 Parquet 的列名，不把整张表载入内存。
         cols = set(pl.scan_parquet(f).collect_schema().keys())
         bad = forbidden & cols
         if bad:
@@ -52,6 +54,7 @@ def main() -> int:
 
     # 2. 被禁用的官方统计文件
     for pat in cfg.get("leakage", {}).get("excluded_files", []):
+        # 只要 processed/ 中出现相关文件，就说明未来统计可能进入了建模流程。
         hits = list(proc.glob(f"*{pat}*"))
         if hits:
             failures.append(f"被禁用的统计文件已进入 processed/: {[h.name for h in hits]}")
@@ -64,6 +67,7 @@ def main() -> int:
             f = proc / name
             if not f.is_file():
                 continue
+            # 用与 preprocess 相同的公式重算日期，统计不一致的行数。
             n_bad = (
                 pl.scan_parquet(f)
                 .filter(
@@ -86,6 +90,7 @@ def main() -> int:
     if not split_file.is_file():
         failures.append("logs_split.parquet 不存在，请先运行 temporal_split")
     else:
+        # 每个 split 只取最早和最晚时间，用它们判断区间是否交叉。
         s = (
             pl.scan_parquet(split_file)
             .group_by("split")
@@ -93,6 +98,7 @@ def main() -> int:
             .collect()
         )
         by = {r["split"]: r for r in s.iter_rows(named=True)}
+        # 按固定顺序比较相邻区间，不能依赖 group_by 返回的随机顺序。
         present = [n for n in ORDER if n in by]
         for a, b in zip(present, present[1:]):
             if by[a]["hi"] >= by[b]["lo"]:
@@ -101,6 +107,7 @@ def main() -> int:
                 log.info("OK  max(%-6s) < min(%s)", a, b)
 
     if failures:
+        # 返回 1 后，run_preprocess.sh 会因为 set -e 立即停止。
         log.error("泄漏检查未通过：")
         for f in failures:
             log.error("  - %s", f)
