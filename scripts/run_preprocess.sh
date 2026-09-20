@@ -9,3 +9,9 @@ python -m src.preprocessing.build_history   --config "$CFG"
 python -m src.preprocessing.build_catalog   --config "$CFG"
 python -m src.preprocessing.build_labels    --config "$CFG"
 python -m src.preprocessing.leakage_check   --config "$CFG"
+
+# T-1 日级特征（plan §8）。验算必须跟在生成之后：口径错误不会抛异常。
+python -m src.features.daily_user_features  --config "$CFG"
+python -m src.features.daily_item_features  --config "$CFG"
+python scripts/verify_t1_features.py        --config "$CFG"
+python scripts/verify_history.py            --config "$CFG"

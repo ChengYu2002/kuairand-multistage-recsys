@@ -1,4 +1,16 @@
 # Two-Tower / ItemCF 召回。负采样对比必须固定除策略外的所有变量（plan §16.6）。
+data_config: configs/data.yaml
+
+# 候选库（plan §14）—— 数字来自 results/schema_report.md
+# 全量 item 空间 437 万，但 65% 只出现过一次，直接在全库上评估会让四种策略全部掉进噪声。
+# 测试期正样本 item 仅 26.9% 在训练期出现过（信息流以新内容为主，72.6% 的视频窗口期内上传）。
+catalog:
+  protocol: A                    # A = warm（训练期见过）, B = time-aware available（含未见新 item）
+  min_train_freq: 5              # 主协议：19.4 万 item / 6.65 万 request，覆盖 12.3% 的测试正 item
+  upload_rule: strict_before     # upload_date < request_date（upload_dt 仅日期粒度）
+  # 辅助设定：min_train_freq=1 -> 170.9 万 item / 12.0 万 request，更难，验证结论稳定性。
+  # 门槛会使候选库偏向较热门 item，README 必须披露（§14.4）。
+
 two_tower:
   embedding_dim: 64
   user_tower_hidden: [256, 128, 64]
@@ -7,7 +19,7 @@ two_tower:
   optimizer: adam
   lr: 0.001
   batch_size: 1024
-  epochs: 5
+  max_steps: 20000               # 固定步数而非 epochs —— 换数据集时训练量才可比（§16.6）
   negatives_per_positive: 10
 
 negative_sampling:
@@ -19,11 +31,10 @@ itemcf:
   similarity: normalized_cooccurrence
   topk_similar: 100
   topk_recall: 500
-
-catalog:
-  protocol: A                    # A = warm catalog, B = time-aware available
-  upload_rule: strict_before     # upload_date < request_date
+  # 预期表现不佳：1000 用户 / 437 万 item，多数 item 仅被一个用户看过，共现矩阵极稀疏。
+  # 这是数据 regime 决定的，不是实现问题，README 中作为观察记录。
 
 eval:
   k_list: [50, 100, 500]
-  request_unit: positive_event   # 测试窗内每个正向事件 = 一个 request
+  request_unit: positive_event   # 测试窗内每个正向事件 = 一个 request（§15）
+  report_per_user_average: true  # 用户活跃度差 1000 倍（116 ~ 127,557），需同时报按用户平均
