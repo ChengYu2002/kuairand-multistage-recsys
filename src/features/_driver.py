@@ -23,7 +23,8 @@ PRIOR_SPLITS = ["warmup"]
 def build(key: str, prefix: str, out_name: str, module: str) -> int:
     ap = argparse.ArgumentParser(prog=module)
     ap.add_argument("--config", default="configs/data.yaml")
-    ap.add_argument("--alpha", type=float, default=20.0, help="贝叶斯平滑强度（虚拟曝光次数）")
+    # 默认值改为 None：真正的取值来自 config，命令行只用于临时覆盖做实验。
+    ap.add_argument("--alpha", type=float, default=None, help="覆盖 config 的 features.smooth_alpha")
     args = ap.parse_args()
 
     log = get_logger(module)
@@ -32,6 +33,7 @@ def build(key: str, prefix: str, out_name: str, module: str) -> int:
     proc = project_path(require(cfg, "dataset", "processed_dir"))
     # require() 的意思是：这个配置必须存在；如果缺少，就直接报错。
     windows = require(cfg, "features", "windows")
+    alpha = args.alpha if args.alpha is not None else require(cfg, "features", "smooth_alpha")
     labels = require(cfg, "labels", "tasks")
 
     src = proc / "logs_split.parquet"
@@ -47,7 +49,7 @@ def build(key: str, prefix: str, out_name: str, module: str) -> int:
     # 根据label 各计算平均值
     # 最后只有一行结果
     prior = prior_lf.select([pl.col(c).mean().alias(c) for c in labels]).collect().row(0, named=True)
-    log.info("平滑先验（仅 %s 段估计，alpha=%.0f）:", "+".join(PRIOR_SPLITS), args.alpha)
+    log.info("平滑先验（仅 %s 段估计，alpha=%.0f）:", "+".join(PRIOR_SPLITS), alpha)
 
     for c, v in prior.items():
         log.info("  %-12s %.5f", c, v)
@@ -60,7 +62,7 @@ def build(key: str, prefix: str, out_name: str, module: str) -> int:
     pairs = distinct_pairs(lf, key)
     log.info("去重 (%s, other, day) 三元组: %s 行", key, f"{len(pairs):,}")
 
-    feat = rolling_features(daily, pairs, key, prefix, labels, windows, args.alpha, prior)
+    feat = rolling_features(daily, pairs, key, prefix, labels, windows, alpha, prior)
 
     # 投射会生成到 max_date + w_max 的目标日；超出数据范围的行永远 join 不到样本，裁掉。
     test_end = require(cfg, "split", "test_end")

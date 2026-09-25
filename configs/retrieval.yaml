@@ -34,6 +34,99 @@ catalog:
     aux_catalog_size: 1708902
     aux_eligible_requests: 120415
 
+# ID 词表（plan §13）—— 把 video_id / author_id / tag 换算成连续行号。
+# 必须落盘：若重算时顺序变化，checkpoint 里「第 N 行」学到的东西就会对应到另一个实体。
+# 这不会报错，只会让指标莫名其妙变差，是最难查的一类问题。
+#
+# 统一约定：index 0 恒为 PAD（历史序列补齐用），index 1 恒为 OOV（字段缺失或未进词表）。
+#
+# ⚠ padding_idx=0 **不能替代 mask**。它只保证 PAD 那一行恒为零向量且不回传梯度，
+#   但 history_emb.mean(dim=1) 仍然会把 PAD 算进分母 —— 历史 5 条和 50 条会差 10 倍尺度。
+#   而本数据集训练时平均 49.7/50 条可编码、测试时只有 8.75/50，训练与测试的尺度会系统性错位。
+#   用户塔必须自己做 masked sum / valid_len，不能图省事直接 mean。
+vocab:
+  video:
+    # 候选集合与「历史可编码集合」是两个不同的问题，不能混：
+    #   候选库  = 模型可以召回哪些视频（freq>=5 的门槛是为了让负采样对比可测）
+    #   词表    = 用户历史里的视频怎么编码（用上面那个门槛毫无道理）
+    # 实测混为一谈的代价（两种分母都列出来，混用会得到对不上的数字）：
+    #   按评估用查询时刻（51,746 个，= 上报 Recall 的口径）
+    #       catalog 16.10% 可编码 / 平均 8.04/50 / 空历史 1.80%
+    #       并集    24.11% 可编码 / 平均 12.05/50 / 空历史 0.37%
+    #   按 test 段全部曝光时刻
+    #       catalog 11.13% / 5.56/50 / 空 8.05%      并集 17.50% / 8.75/50 / 空 2.76%
+    #   训练段（并集）：99.41% 可编码，平均 49.67/50
+    #
+    # 布局：index 2~194,311 依候选库顺序（train_freq desc, video_id asc），
+    # 194,312~897,504 是仅出现在历史里的 item（按 video_id 升序，共 703,193 个）。
+    # 物品塔打分直接切 [2 : 194,312] 连续区间，召回范围不受词表扩大影响。
+    source: catalog_union_train_positive
+    history_splits: [train]  # 并进词表的「仅历史」视频取自哪几段。独立于 itemcf.profile_splits ——
+                             # 双塔的词表不该由 ItemCF 的配置控制。
+    oov: true                # index 1 留给 OOV。**必须留**：否则 mapping.get(vid, 1) 会把
+                             # 未知视频静默当成 index 1 那个真实视频，不报错、查不出来。
+                             # OOV 只用于**编码历史**，永远不作为训练目标 —— 目标不在词表的
+                             # 训练正样本仍然直接丢弃，所以不会出现「所有正样本学到同一个
+                             # OOV 向量」那种污染。用户塔 pooling 时把 OOV 与 PAD 一并 mask。
+                             # 新增的 703,193 个里有 702,740 个（99.9%）出现在训练历史中，
+                             # 中位 20 次、99.6% >=5 次，能吃到梯度；但这些出现高度相关
+                             # （同一用户的连续窗口），有效信号约等于接触过它的不同用户数，
+                             # 而它们训练期曝光 <5 次，所以很薄，别指望学得好。
+  author:
+    min_videos: 2            # 候选库内至少 2 个视频才单独建 index，其余并入 OOV。
+                             # 实测 94,113 个作者对 194,310 个视频，中位每人仅 1 个 —— 单视频作者的
+                             # embedding 只是 video 向量的复制品，没有泛化价值，反而增加过拟合面。
+                             # >=2 保留 31,529 人（33.5%），覆盖 67.8% 的候选视频。
+    oov: true
+  tag:
+    min_videos: 1            # 候选库内只有 48 个不同 tag，属低基数类别，无需门槛。
+    oov: true                # 2.079% 的候选视频没有 tag
+  # 口径回归锁 —— 与 catalog.expected 同样的动机：词表一旦被改动，checkpoint 会静默失效。
+  # 换数据集时必须替换成该数据集自己的实测值，不能删（verify_vocab.py 带 --require-golden）。
+  expected:
+    video_entities: 897503
+    video_rows: 897505          # 含 index 0 (PAD) 与 index 1 (OOV)，建 nn.Embedding 用这个数
+    video_catalog_index_min: 2        # 打分时切 [2 : 194312]
+    video_catalog_index_max: 194311
+    author_entities: 31529
+    author_rows: 31531          # 含 PAD 与 OOV
+    tag_entities: 48
+    tag_rows: 50
+
+  # 侧信息缺失率（候选库内实测）：author_id 0%，tag 2.079%，upload_dt 0.002%，video_duration 4.809%。
+  # 每视频 tag 数中位 1、最大 4，多 tag 占 14.0%（全量视频表为 22.3% / 58 个 tag；
+  # data.yaml 里记的 24.7% 来自 1,000 条抽样，以此处实测为准）。
+
+# 物品静态属性（阶段 0 的 ② video_age / ③ tag multi-hot）。
+# age 不落盘 —— 它随请求日变化，而物品向量要离线算一次建索引。只存 upload_date，
+# age 由使用方现算（src.features.video_age.age_days）。
+item_static:
+  # 已知问题：曝光记录的中位 age 在 train 段 2 天、valid 12 天、test 23 天。
+  # 成因有三层叠加 —— 词表固定为 warm 集合、评估只保留其中可编码的部分、以及视频本身
+  # 随时间自然变老。这是**条件分布**的变化，不代表原始视频总体发生了异常漂移。
+  # 但后果是实在的：物品塔若用 age，会在 age≈2 上训练、在 age≈23 上评估，必须在报告中披露。
+  expected:
+    rows: 897503
+    missing_upload_date: 18
+    missing_tag: 26771
+    missing_duration: 64045
+    author_oov: 589401
+    max_tags_per_video: 5
+    max_age_days: 1190          # 词表可编码曝光实测（4,809,007 条，非全部 901.5 万条）；最小 0，无负值
+
+# 特征编码（阶段 0 的 ⑤）。
+encoder:
+  stats_basis: train_samples   # 归一化统计量按什么加权。
+                               #   train_samples —— 按 train 段**曝光样本**统计（含冷启动样本）。
+                               #     这是模型实际吃到的分布，标准化的本意就是把它压到 0/1。
+                               #   entity_date   —— 按唯一 (实体, 日期) 特征行等权。描述的是
+                               #     特征表本身，而同一行会被多个样本重复读取，
+                               #     因此模型看到的并不是 0/1。实测差距很大：
+                               #       item_imp_7d 按特征行等权 -> 样本上 mean -0.32 / std 2.16
+                               #       user_imp_7d 按特征行等权 -> 样本上 mean  0.71 / std 0.81
+                               # 冷启动样本**计入**统计：56.3% 的输入本来就是冷启动行，
+                               # 把它们排除掉，标准化就不再描述真实输入分布。
+
 two_tower:
   embedding_dim: 64
   user_tower_hidden: [256, 128, 64]

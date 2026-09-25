@@ -11,6 +11,10 @@ python scripts/verify_retrieval_metrics.py --config "$CFG"
 # 「共现太稀疏」在指标上长得一样，只有验算能把两者切开。
 python scripts/verify_itemcf.py --config "$CFG"
 
+# 全库检索：双塔评估要用它把向量变成 Top-K。与模型无关，先验过再谈模型。
+# （exposure 负样本直接取自「曝光但未正向」的日志，不经过打分器，别混为一谈。）
+python scripts/verify_ann_index.py --full-scale
+
 python -m src.retrieval.itemcf --config "$CFG"                                  # ItemCF-50   主基线
 python -m src.retrieval.itemcf --config "$CFG" --iuf true                       # ItemCF-50-IUF 活跃度惩罚消融
 python -m src.retrieval.itemcf --config "$CFG" --history all_before --score-block 200  # ItemCF-All 历史长度消融

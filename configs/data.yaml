@@ -39,7 +39,13 @@ history:
 features:
   snapshot: T-1            # Day T 样本只允许使用 <= T-1 的聚合
   windows: [1, 3, 7]
-  tag_is_multivalue: true  # tag 为逗号分隔，24.7% 的视频有多个 tag，需 multi-hot
+  smooth_alpha: 20.0       # 贝叶斯平滑强度（虚拟曝光次数）。原本只是 _driver.py 的 argparse
+                           # 默认值，没有进 config —— 换数据集时会静默沿用。
+                           # 平滑率 = (num + alpha*g) / (imp + alpha)，g 为 warmup 段先验。
+                           # 编码器填充缺失的平滑率时必须用同一个 g（num=imp=0 时公式恰好等于 g）。
+  tag_is_multivalue: true  # tag 为逗号分隔，需 multi-hot。全量视频表实测 22.3% 多 tag / 58 个 tag；
+                           # 候选库内 14.0% / 48 个 tag（以此为准，见 retrieval.yaml 的 vocab 段）。
+                           # 原记的 24.7% 来自 1,000 条抽样，已作废。
   upload_dt_has_time: false  # 仅日期粒度 -> 候选库用 upload_date < request_date（§14.1）
 
 # 正样本率实测（限定 tab 1/2/4，共 901.5 万行）
