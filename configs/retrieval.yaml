@@ -1,15 +1,38 @@
 # Two-Tower / ItemCF 召回。负采样对比必须固定除策略外的所有变量（plan §16.6）。
 data_config: configs/data.yaml
 
-# 候选库（plan §14）—— 数字来自 results/schema_report.md
-# 全量 item 空间 437 万，但 65% 只出现过一次，直接在全库上评估会让四种策略全部掉进噪声。
-# 测试期正样本 item 仅 26.9% 在训练期出现过（信息流以新内容为主，72.6% 的视频窗口期内上传）。
+# 候选库（plan §14）—— 数字为 build_catalog.py 实测，非估计值。
+# 全量 item 空间 437 万（含从未曝光者）；主建模范围 tab 1/2/4 内 313.7 万，
+# 其中 64.1% 只出现过一次。直接在全库上评估会让四种负采样策略全部掉进噪声。
 catalog:
   protocol: A                    # A = warm（训练期见过）, B = time-aware available（含未见新 item）
-  min_train_freq: 5              # 主协议：19.4 万 item / 6.65 万 request，覆盖 12.3% 的测试正 item
-  upload_rule: strict_before     # upload_date < request_date（upload_dt 仅日期粒度）
-  # 辅助设定：min_train_freq=1 -> 170.9 万 item / 12.0 万 request，更难，验证结论稳定性。
-  # 门槛会使候选库偏向较热门 item，README 必须披露（§14.4）。
+  train_splits: [train]          # 频次只数这几段 —— 必须显式写死，不能靠默认值。
+                                 # README §6 曾写作「train/val」，以此处为准：valid 保持
+                                 # 干净调参集的身份，不参与候选库构建。
+                                 # 若改成 [warmup, train]，候选库会变成 28.2 万 item，是另一套口径。
+  min_train_freq: 5              # 主协议：19.4 万 item / 6.65 万 request
+  aux_min_train_freq: 1          # 辅助协议：170.9 万 item / 12.0 万 request，验证结论是否随门槛变化
+  eval_split: test               # request 取自哪一段
+  upload_rule: strict_before     # upload_date < request_date（upload_dt 仅日期粒度）。Protocol B 用，未实现。
+  # 门槛使候选库偏向较热门 item，README 必须披露（§14.4）。
+  # 关键限制：门槛把 request 覆盖率从 21.9% 压到 12.1%（少 53,879 个 request，9.8 个百分点）；
+  # 但 21.9% 这个上限与门槛无关 —— 测试期 78.1% 的正向事件，其目标 item 在训练段一次都
+  # 没出现过。即门槛的影响与天花板是两件事。天花板由「训练期见过」这一前提本身造成，
+  # 调门槛突破不了，只能靠 Protocol B + 带 side feature 的物品塔（§7.2 那张表因此是必答题）。
+
+  # 口径回归锁 —— 这些不是参数，是「这套口径应当产出什么」的冻结实测值。
+  # 动机：Week 3/4 的四种负采样、四种共享机制全部建立在同一个候选库上，口径被
+  # 误改而无人察觉，会让所有对比一起失效且看不出异常。verify_catalog.py 逐项断言。
+  # 换数据集时必须替换成该数据集自己的实测值，不能删 —— 删掉等于没有保护，
+  # 而 run_preprocess.sh 带 --require-golden，缺这一段会直接失败。
+  expected:
+    dataset: KuaiRand-1K
+    train_seen_items: 1708902        # 训练段出现过的 item
+    eval_positive_events: 550316     # test 段正向事件总数（= request 覆盖率的分母）
+    main_catalog_size: 194310
+    main_eligible_requests: 66536
+    aux_catalog_size: 1708902
+    aux_eligible_requests: 120415
 
 two_tower:
   embedding_dim: 64
@@ -27,14 +50,65 @@ negative_sampling:
   hybrid_mix: {random: 0.5, exposure: 0.5}
   logq_correction: false         # P1
 
+# ItemCF（plan §16）。两个矩阵必须分开，混为一谈会得到完全不同的实验：
+#   M —— 学 item-item 相似度用，必须用 train 段**全部**正向行为。限制成最近 50 会让
+#        共现从 12.07 亿对掉到 124 万对，绝大多数 item 对变成零共现，相似度表形同虚设。
+#   H —— 打分时的查询历史，取 request 时刻**严格之前**的行为。这一份要和双塔对齐，
+#        否则 ItemCF vs 双塔的差异分不清来自模型还是来自输入。
 itemcf:
-  similarity: normalized_cooccurrence
-  topk_similar: 100
-  topk_recall: 500
-  # 预期表现不佳：1000 用户 / 437 万 item，多数 item 仅被一个用户看过，共现矩阵极稀疏。
+  similarity: cosine             # |Ui∩Uj| / sqrt(|Ui|·|Uj|)
+  profile_splits: [train]        # M 的来源段
+  history: recent50              # H 的口径：recent50 | all_before
+  history_max_len: 50            # recent50 时的上限；all_before 时忽略（实测中位 4,271）
+  iuf: false                     # 活跃用户惩罚 1/log(1+|Iv|)，作为独立消融而非默认
+  zero_self_similarity: true     # sim(j,j)=0。不置零的话 50 个历史 item 会自带满分霸占榜首，
+                                 # 而正确答案是已看 item 的只占 0.04%，纯属浪费坑位。
+                                 # 这是相似度定义的一部分，不是「排除已看视频」的后处理。
+  topk_similar: 100              # 每个历史 item 只为它最相似的 100 个候选投票
+  sim_decimals: 9                # 排序前把相似度/得分量化到这么多位小数。
+                                 # 必须有：数学上相等的相似度（如 3/√27 与 2/√12 同为 1/√3）
+                                 # 在浮点下会差 1 个 ULP，单个 item 就能有上百个这样的值挤在
+                                 # 截断边界上。不量化的话「谁进 top-100」由浮点噪声决定，
+                                 # 换 BLAS 或换机器结果就会变，可复现性形同虚设。
+  topk_recall: 500               # 必须 >= max(eval.k_list)
+  pad_order: catalog_asc         # 非零候选不足 topk_recall 时的补位顺序。
+                                 # 零分候选本质上全部并列，必须与「并列取下标小者」一致，
+                                 # 即 catalog_asc。改成 catalog_desc 可报告该选择的敏感性
+                                 # （实测影响 13.28% 的查询时刻，Recall@500 差约 5%）。
+  sim_block: 2000                # 相似度分块行数
+  score_block: 2000              # 打分分块的查询时刻数
+  # 截断之后全程稀疏：每个 request 的候选上限 = history_max_len x topk_similar = 5,000，
+  # 因此不存在 51,746 x 194,310 的稠密打分矩阵。all_before 那版才需要认真分块。
+  # 不足 topk_recall 时按 pad_order 补位，默认 catalog_asc（热门优先）—— 零分候选本质上
+  # 全部并列，补位顺序必须与「并列取下标小者」一致。实测 13.28% 的查询时刻会走到补位，
+  # 这部分 Top-K 不由 ItemCF 决定，报告中必须与补位率一并披露。
+  #
+  # 三个版本的定位（不跑 2x2 四格）：
+  #   ItemCF-50      recent50   + cosine       主基线
+  #   ItemCF-All     all_before + cosine       历史长度消融
+  #   ItemCF-50-IUF  recent50   + cosine+IUF   活跃度惩罚消融
+  #
+  # 预期表现不佳：993 用户 / 19.4 万候选，多数 item 仅被 6.2 个用户看过，共现极稀疏。
   # 这是数据 regime 决定的，不是实现问题，README 中作为观察记录。
 
 eval:
   k_list: [50, 100, 500]
   request_unit: positive_event   # 测试窗内每个正向事件 = 一个 request（§15）
-  report_per_user_average: true  # 用户活跃度差 1000 倍（116 ~ 127,557），需同时报按用户平均
+  positive_signal: [is_click, long_view]
+  # positive_signal 与 data.yaml 的 history.positive_signal 目前一致，但独立可配：
+  # 改历史序列口径不应该静默改掉评估协议。
+  report_per_user_average: true  # 用户活跃度差 7,900 倍（16 ~ 125,944 条曝光），需同时报按用户平均
+
+  # 尺子的校准靶 —— 热度基线（Protocol A，所有 request 推同一份榜单）在本实现下的实测值。
+  # 动机：retrieval_metrics 是 ItemCF / 双塔 / 四种负采样共用的唯一度量入口，它一旦算错，
+  # 所有模型会**一起**错到同一个方向，对比看上去依然正常。因此必须有一个与模型无关、
+  # 可独立重算的定点把实现钉住。verify_retrieval_metrics.py 逐项断言（容差 1e-6）。
+  # 注意 recall@500 依赖候选库排序：第 500 名 train_freq=114，17 个并列（排名 488~504），
+  # 顺序变了这个数就变 —— verify_catalog 的 A 层有对应的落盘顺序断言。
+  expected_popularity_baseline:
+    recall@50:  0.002224
+    recall@100: 0.004900
+    recall@500: 0.023010
+    ndcg@50:    0.000588
+    ndcg@100:   0.001013
+    ndcg@500:   0.003279

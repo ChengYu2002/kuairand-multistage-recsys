@@ -21,7 +21,7 @@ Raw KuaiRand Logs
         ↓
 Feature / Data Pipeline        (user sampling → temporal split → T-1 snapshots)
         ↓
-Multi-channel Retrieval        (Two-Tower + ItemCF → candidate union)
+Multi-channel Retrieval        (Two-Tower / ItemCF —— 见下方说明)
         ↓
 [Optional] Coarse Ranking      (LightGBM, P1)
         ↓
@@ -34,6 +34,14 @@ Offline Evaluation
 
 架构是完整链路，但离线实验**不要求所有阶段 end-to-end 串联训练**，分为
 Track A (Retrieval) 与 Track B (Ranking & Multi-task) 两条轨道。
+
+> **关于 candidate union**：上图是工业链路的完整形态，真实系统会把多路召回合并成
+> 一个候选集再交给排序。但本项目**不用 union 产出任何上报的召回指标**，每一路召回
+> 都在同一个候选库上独立评估。原因是研究问题一要比较四种负采样策略对双塔的影响 ——
+> 一旦把 ItemCF 的结果并进候选集，双塔的 Recall 就不再可归因，策略间的差异会被另一路
+> 召回的贡献掩盖。ItemCF 在本项目中的定位是**经典非神经基线**，不是召回源。
+> Track B（排序与多任务）在打过标的曝光日志上训练与评估，也不消费 union，因此
+> union 目前没有实现，且不是 P0 交付物。
 
 ## 3. Dataset & Split
 
@@ -62,16 +70,75 @@ Day T 的样本只允许使用 **Day T-1 及更早**日志生成的聚合特征�
 
 ## 6. Candidate Catalog & Request Unit
 
-- **Protocol A — Warm Catalog**：只含 train/val 阶段出现过的 item。
-- **Protocol B — Time-aware Available Catalog**：允许 `upload_date < request_date` 的未见新 item。
-- **Request Unit**：测试窗口内**每一个正向点击 / 有效播放事件** = 一个 retrieval request。
+- **Protocol A — Warm Catalog**：只含 **train 段**出现过、且曝光次数达到频次门槛的 item。
+  不含 warmup 与 valid：valid 保持干净调参集的身份。口径与实测规模（KuaiRand-1K）：
 
+  | 协议 | 门槛 | 候选库 item | 有效 request | request 覆盖率 |
+  |---|---|---:|---:|---:|
+  | 主协议 | `train_freq >= 5` | 194,310 | 66,536 | 12.1% |
+  | 辅助协议 | `train_freq >= 1` | 1,708,902 | 120,415 | 21.9% |
+
+- **Protocol B — Time-aware Available Catalog**：允许 `upload_date < request_date` 的未见新
+  item（`upload_dt` 仅日期粒度，故为严格小于）。**尚未实现**。
+- **Request Unit**：测试窗口内**每一个正向点击 / 有效播放事件**（`is_click or long_view`）
+  = 一个 retrieval request。测试窗共 550,316 个正向事件，其中 66,536 个的目标 item 落在
+  主协议候选库内。注意 66,536 个事件只对应 51,746 个不同的 `(user, time_ms)` 查询时刻 ——
+  一次请求返回一批视频，用户可能点击其中多个，这些事件共享同一份查询上下文。
+
+> 必须与 Recall 一并披露的限制：频次门槛使候选库偏向较热门 item，主协议仅覆盖 12.1%
+> 的测试正向事件。这个低覆盖率有**两层成因，不能只归给门槛，也不能说与门槛无关**：
+>
+> 1. 门槛本身让覆盖率从 21.9% 降到 12.1%，即少掉 53,879 个 request（9.8 个百分点）；
+> 2. 21.9% 这个**上限**则来自 Protocol A「训练期必须见过」的前提 —— 测试期 78.1% 的
+>    正向事件，其目标 item 在训练段一次都没出现过（本数据集 72.6% 的视频是 31 天窗口
+>    期内上传的，内容换代极快）。
+>
+> 也就是说：调门槛最多把覆盖率拉回 21.9%，再往上只能靠 Protocol B + 带 side feature
+> 的物品塔。
+>
 > The sampled catalog is an offline approximation and inherits selection bias from the
 > sampled users and logged exposures.
 
 ## 7. Results
 
 ### 7.1 Negative Sampling (Two-Tower)
+
+**非神经基线（双塔必须跨过的地板）** —— Protocol A，66,536 条考题，按 request 平均：
+
+| Baseline | Recall@50 | Recall@100 | Recall@500 | NDCG@100 |
+|---|---:|---:|---:|---:|
+| Random guess | — | 0.000515 | — | — |
+| **Popularity** | **0.00222** | **0.00490** | **0.02301** | **0.00101** |
+| ItemCF-50（主基线） | 0.00095 | 0.00150 | 0.00942 | 0.00036 |
+| ItemCF-50-IUF（消融） | 0.00092 | 0.00167 | 0.00899 | 0.00038 |
+| ItemCF-All（消融） | 0.00005 | 0.00017 | 0.00532 | 0.00003 |
+
+观察记录（非实现缺陷，已由 19 项独立验算排除实现错误）：
+
+- **标准余弦 ItemCF 在本数据上低于热度基线。** 机制是极稀疏共现下的冷门偏置：每个
+  item 平均只被 6.2 个用户看过，绝大多数共现次数为 1，`|Ui∩Uj| / √(|Ui||Uj|)` 的分子
+  近似常数，排序几乎完全由分母决定，于是余弦退化成「谁更冷门谁排前面」。实测
+  ItemCF-50 的 Top-100 中位 `train_freq` = 7，而考题答案中位 = 14、候选库全体中位 = 8
+  —— 推荐分布与目标分布方向相反，因此可以低于随机猜测。
+- **历史越长反而越差**（ItemCF-All < ItemCF-50）：历史从 50 条放大到中位 4,271 条后，
+  被翻出来的超冷门 item 更多，冷门偏置被进一步放大。
+- **IUF 影响很小且方向不一致**（@100 略升、@500 略降），不进主线。
+- **UserCF 一次性诊断**：R@100 ≈ 0.0087（静态用户画像口径，未做正式实现与验算），
+  用于确认协同信号确实存在、排除「CF 在本数据上全盘失效」。因「最相似用户」这一量
+  在 1,000 用户抽样下被抽样本身扭曲（而 item-item 共现是物品目录的真实属性，样本量
+  增大会收敛），UserCF 不进主线，仅作记录。
+
+必须与上表一并披露的口径：
+
+- **补位**：ItemCF-50 有 **13.28%** 的查询时刻非零候选不足 500，尾部由 `pad_order`
+  （默认 `catalog_asc`，热门优先）填充，这部分 Top-K 不由 ItemCF 决定。改用
+  `catalog_desc` 时 Recall@500 约差 5%（0.00942 vs 0.00894）。
+- **不排除已看视频**：为使各召回方法的后处理完全一致，一律不排除用户历史视频。
+  代价是热度基线 Top-50 中有 26.3% 是该用户训练期已曝光的项。
+- **查询单位**：66,536 条考题只对应 51,746 个不同的 `(user_id, time_ms)`；同一时刻的
+  考题共享同一份 Top-K。
+
+**四种负采样策略对比** —— 同一候选库、同一考题集、除负采样外所有变量固定（§16.6）：
 
 | Strategy | Recall@50 | Recall@100 | Recall@500 | NDCG@100 |
 |---|---:|---:|---:|---:|
@@ -138,9 +205,10 @@ bash scripts/run_sparsity.sh
 
 ## 10. Scope Guardrail
 
-Retrieval P0 只含 ItemCF + Two-Tower + 四种负采样 + Recall/NDCG 评估 + 简单 candidate union。
-在多任务主线（MMoE / PLE / Selective Sharing / Controlled Sparsity / 3-seed）全部完成前，
-**不新增** popularity / author / tag / freshness 等启发式召回源。时间预算约为
+Retrieval P0 只含 ItemCF + Two-Tower + 四种负采样 + Recall/NDCG 评估。**不含 candidate
+union** —— 每一路召回独立评估，理由见 §2。在多任务主线（MMoE / PLE / Selective Sharing /
+Controlled Sparsity / 3-seed）全部完成前，**不新增** popularity / author / tag / freshness
+等启发式召回源，也不新增第二个协同过滤基线（UserCF 已作一次性诊断，结论见 §7.1）。时间预算约为
 data 25% / retrieval 25% / MTL 35% / analysis 15%。
 
 ## 11. License
