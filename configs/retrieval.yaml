@@ -129,19 +129,41 @@ encoder:
 
 two_tower:
   embedding_dim: 64
-  user_tower_hidden: [256, 128, 64]
+  user_tower_hidden: [256, 128, 64] # 用户塔和物品塔的 MLP 层宽：先输出 256 维，再压到 128，最终输出 64 维
   item_tower_hidden: [256, 128, 64]
-  item_tower_config: id_only     # id_only | id_side
+  item_tower_config: id_only     # id_only | id_side。两者共用同一个 MLP 结构，只有输入特征不同 ——
+                                 # 否则 §7.2 的对比会同时差了特征与深度，无法归因。
+  share_item_embedding: true     # 物品塔与用户塔共用一份 item embedding。词表取并集的理由正在于此：
+                                 # 只出现在历史里的 70.3 万个 item 也能吃到梯度。
+  mask_oov_in_history: true      # 历史池化时 OOV(index 1) 与 PAD(0) 一同 mask。
+                                 # 评估时 82.5% 的历史条目是 OOV，不 mask 会让池化被同一个向量主导。
+  empty_history: zero_vector     # hist_len=0 时历史通道输出零向量（不除零、不退化成 OOV 向量）。
+                                 # 模型靠 hist_len 与 user_has_history 区分「没有兴趣可读」。
   optimizer: adam
   lr: 0.001
   batch_size: 1024
   max_steps: 20000               # 固定步数而非 epochs —— 换数据集时训练量才可比（§16.6）
   negatives_per_positive: 10
+  temperature: 0.05              # 点积除以它再进 softmax。L2 归一化后点积落在 [-1,1]，
+                                 # 不除的话 logits 太平、梯度太小。
+  train_target_scope: catalog    # 训练正样本的目标取自 catalog 还是 vocab。
+                                 # **必须与负样本同一个空间**，否则会制造一条捷径：
+                                 # 若正样本可以在 vocab 任意位置、负样本却只来自候选库，
+                                 # 那么「不在候选库」就完美预测「是正样本」（占 42%），
+                                 # 而候选库成员身份恰好由 index 区间编码，模型学得到。
+                                 # 选 catalog 的代价：训练正样本从 208 万降到 121 万（-42%）。
+                                 # 但那 42% 的 item 仍会通过用户塔的历史池化吃到梯度，
+                                 # 并非完全浪费；而 121 万 x 17 遍（2 万步 x 1024）也够训。
 
 negative_sampling:
   strategy: random               # random | inbatch | exposure | hybrid
   hybrid_mix: {random: 0.5, exposure: 0.5}
   logq_correction: false         # P1
+  # 统一接口（Week 3 插 exposure / hybrid 时不得改动其他任何代码）：
+  #   sample(batch, n_neg, generator) -> LongTensor (B, n_neg)，元素是词表行号
+  # 采样空间一律是候选库区间 [2, 194311] —— 见 two_tower.train_target_scope 的理由。
+  # 「负样本恰好等于正样本」由损失函数统一屏蔽（accidental hit），不要求采样器自己规避：
+  # 四种策略的规避难度不同，放在损失里才能保证它们面对完全一样的处理。
 
 # ItemCF（plan §16）。两个矩阵必须分开，混为一谈会得到完全不同的实验：
 #   M —— 学 item-item 相似度用，必须用 train 段**全部**正向行为。限制成最近 50 会让

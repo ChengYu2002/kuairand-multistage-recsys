@@ -15,10 +15,19 @@ python scripts/verify_itemcf.py --config "$CFG"
 # （exposure 负样本直接取自「曝光但未正向」的日志，不经过打分器，别混为一谈。）
 python scripts/verify_ann_index.py --full-scale
 
+# 两个塔：掩码不变性是重点 —— padding_idx 不能替代 mask，写错会让训练/评估尺度差约 4 倍。
+python scripts/verify_towers.py --config "$CFG"
+
+# 损失与负采样：accidental hit 屏蔽、采样器接口契约、端到端确定性。
+# 契约不统一的话，Week 3 插 exposure / hybrid 就得改别处代码，验收标准第 3 条当场失效。
+python scripts/verify_two_tower.py --config "$CFG"
+
 python -m src.retrieval.itemcf --config "$CFG"                                  # ItemCF-50   主基线
 python -m src.retrieval.itemcf --config "$CFG" --iuf true                       # ItemCF-50-IUF 活跃度惩罚消融
 python -m src.retrieval.itemcf --config "$CFG" --history all_before --score-block 200  # ItemCF-All 历史长度消融
-for NEG in random inbatch exposure hybrid; do
+# 只跑已实现的策略。exposure / hybrid 是 Week 3 的内容，现在列进来会让
+# set -e 在第三轮直接终止整个流水线。加上时把它们补进这个列表即可。
+for NEG in random inbatch; do
   python -m src.retrieval.two_tower --config "$CFG" --negative "$NEG"
 done
 python -m src.evaluation.negative_sampling_analysis --config "$CFG"

@@ -419,9 +419,13 @@ def main() -> int:
         )
 
     # 映射回 66,536 条考题
+    # 显式保序：polars 的 left join 不保证输出顺序与左表一致，顺序一乱每条考题就会
+    # 拿到别人的 Top-K，且不会报错。
     mid = (
         reqs.select("user_id", "time_ms")
+        .with_row_index("_i")
         .join(moments.with_row_index("mid"), on=["user_id", "time_ms"], how="left")
+        .sort("_i")
         .get_column("mid").to_numpy()
     )
     topk = cat_ids[topk_idx][mid]

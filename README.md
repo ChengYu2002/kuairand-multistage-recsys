@@ -3,7 +3,11 @@
 > Industrial-style multi-objective short-video recommendation system built on KuaiRand:
 > global temporal splitting, T-1 feature snapshots, two-tower retrieval, and multi-task ranking.
 
-**状态：🚧 骨架搭建中（Week 1）。** 完整设计见本地个人笔记 `note/plan_architecture.md`（不入库）。
+**状态：🚧 Week 2 进行中 —— 召回主线已跑通，排序尚未开始。**
+完整设计见本地个人笔记 `note/plan_architecture.md`（不入库）。
+
+已完成：数据管线、候选库与词表、召回指标、ItemCF、全库检索、双塔（random / in-batch）。
+未完成：Single-Task 排序基线、exposure / hybrid 负采样、MMoE / PLE / Selective Sharing。
 
 ---
 
@@ -138,14 +142,24 @@ Day T 的样本只允许使用 **Day T-1 及更早**日志生成的聚合特征�
 - **查询单位**：66,536 条考题只对应 51,746 个不同的 `(user_id, time_ms)`；同一时刻的
   考题共享同一份 Top-K。
 
-**四种负采样策略对比** —— 同一候选库、同一考题集、除负采样外所有变量固定（§16.6）：
+**四种负采样策略对比** —— 同一候选库、同一考题集、除负采样外所有变量固定（§16.6）。
+20,000 步，embedding_dim 64，temperature 0.05，10 负样本/正样本，item tower = ID-only：
 
-| Strategy | Recall@50 | Recall@100 | Recall@500 | NDCG@100 |
-|---|---:|---:|---:|---:|
-| Random | | | | |
-| In-batch | | | | |
-| Exposure | | | | |
-| Hybrid | | | | |
+| Strategy | Recall@50 | Recall@100 | Recall@500 | NDCG@100 | 末 100 步 loss |
+|---|---:|---:|---:|---:|---:|
+| **Random** | **0.00513** | **0.00888** | **0.03523** | **0.00196** | 0.2476 |
+| In-batch | 0.00277 | 0.00531 | 0.02579 | 0.00112 | 0.2977 |
+| Exposure | *未实现* | | | | |
+| Hybrid | *未实现* | | | | |
+
+Random 达到热度基线的 **1.81 倍**，In-batch 仅 1.08 倍。
+
+> ⚠️ **当前结果只有 seed 42 一个种子。** Random 与 In-batch 的差距有多少来自种子噪声
+> 尚未验证；§26 要求的 3 seeds + mean ± std 对负采样对比同样适用，报告前必须补齐。
+
+训练与评估口径：正样本取 train 段正向事件且目标落在候选库内（121 万条，占全部正样本
+的 58%）。**正负样本必须同空间** —— 若正样本可在词表任意位置而负样本只来自候选库，
+「不在候选库」就完美预测「是正样本」（占 42%），而成员身份恰好由 index 区间编码。
 
 ### 7.2 Item Tower / Cold Start
 
@@ -189,7 +203,7 @@ bash scripts/run_sparsity.sh
 ├── src/
 │   ├── preprocessing/  抽样、清洗、时间切分、历史序列、候选库、标签、泄漏检查
 │   ├── features/       T-1 日级 user / item / author / tag 特征、video age、编码
-│   ├── retrieval/      ItemCF、Two-Tower、四种负采样、LogQ、ANN
+│   ├── retrieval/      ItemCF、Two-Tower、负采样、全库检索（暴力分块，非 ANN）、数据装载
 │   ├── ranking/        Single-Task、MMoE、PLE、Selective Sharing、DIN(P2)
 │   ├── prerank/        LightGBM 粗排 (P1)
 │   ├── analysis/       受控稀疏、负迁移、冷启动、参数预算
@@ -206,7 +220,9 @@ bash scripts/run_sparsity.sh
 ## 10. Scope Guardrail
 
 Retrieval P0 只含 ItemCF + Two-Tower + 四种负采样 + Recall/NDCG 评估。**不含 candidate
-union** —— 每一路召回独立评估，理由见 §2。在多任务主线（MMoE / PLE / Selective Sharing /
+union** —— 每一路召回独立评估，理由见 §2。全库检索用**精确的分块暴力**而非 ANN：
+19.4 万候选暴力只要 13.3 秒，而 ANN 的近似误差会混进四种策略的对比里（§16.6 要求
+除采样外无任何差异）。在多任务主线（MMoE / PLE / Selective Sharing /
 Controlled Sparsity / 3-seed）全部完成前，**不新增** popularity / author / tag / freshness
 等启发式召回源，也不新增第二个协同过滤基线（UserCF 已作一次性诊断，结论见 §7.1）。时间预算约为
 data 25% / retrieval 25% / MTL 35% / analysis 15%。
