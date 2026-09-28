@@ -124,3 +124,20 @@ rank_item:
                                # 历史项早已被压成 OOV，原始 id 丢了，换词表救不回来；而换成 >=5
                                # 会把历史砍掉一半（0.5605/0.0941）。历史自身不构成捷径：
                                # hist_len 单特征 AUC train 0.4983 / test 0.5942，方向相反。
+
+# ---- User x Author 偏好特征（plan §8.4）----
+# 为什么需要：Single-Task 在 valid 上 is_follow 的 GAUC = 0.49014、is_comment = 0.50537 ——
+# 同一用户内部排序与随机无异。模型完全没有 user x author 交互特征：用户侧只有历史视频的
+# 池化均值，物品侧只有作者 embedding，靠 MLP 反推"是否同一作者"极难。
+# 实测单特征 ua_imp_7d 的 GAUC：is_follow 0.53784 / is_comment 0.53764 —— 一个计数特征
+# 打赢整个 3,750 万参数的模型，说明信号存在、只是没进 x。
+pair_preference:
+  windows: [3, 7]              # 不取 1 天。(user,author,date) 日表 8,371,862 行而原始日志
+                               # 9,015,279 行 —— 平均每个三元组只出现 1.08 次，1 天窗口对
+                               # 约 96% 的样本恒为 0，是一列死特征。
+  labels: [is_click, long_view, is_like]
+                               # 不含 is_comment / is_follow 的计数：pair 维度曝光量 0~4，
+                               # 这两个标签的计数在 >99.9% 的行上恒为 0。
+  rate_labels: [is_click, long_view]
+                               # 只给密集信号算平滑比率。给 0.11% 的事件在 0~4 次曝光上
+                               # 算比率是纯噪声。

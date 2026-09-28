@@ -19,7 +19,11 @@
    **历史通道仍用召回词表**，与目标不共享 embedding 表。两者在排序里没有共享的必要
    （那是双塔为了离线建索引才有的约束），而换词表救不回历史、换小词表会砍掉一半
    可编码率。历史自身不是捷径：hist_len 单特征 AUC train 0.4983 / test 0.5942。
-4. **不抽负样本**。曝光了没点就是负样本，现成的。
+4. **加 user x author 偏好特征**（plan §8.4）。Single-Task 在 is_follow 上的 GAUC 是
+   0.49014 —— 用户内部排序≈随机，因为模型没有任何 user x author 交互特征。实测单特征
+   ua_imp_7d 的 GAUC 就有 0.53784，打赢整个模型。矩阵按**样本行**对齐（pair 维度
+   4,168,620 个键对 4,496,306 条样本，几乎一一对应，行号间接层省不到东西）。
+5. **不抽负样本**。曝光了没点就是负样本，现成的。
 
 因此 batch() 会把 RetrievalData 塞进来的召回侧物品静态键**显式弹掉**，再放进排序版的
 同名键。弹而不是直接覆盖：万一将来 RetrievalData 改了键名，这里会抛 KeyError 而不是
@@ -151,7 +155,7 @@ class RankItemStatic:
 class RankingData:
     def __init__(self, proc: Path | str, protocol: str, split: str,
                  item_static: RankItemStatic, max_hist: int = 50,
-                 mask_oov: bool = True) -> None:
+                 mask_oov: bool = True, pair_features: bool = True) -> None:
         proc = Path(proc)
         self.proc, self.protocol, self.split = proc, protocol, split
         self.item_static = item_static
@@ -159,10 +163,25 @@ class RankingData:
         self.inner = RetrievalData(proc, protocol, split, max_hist=max_hist,
                                    mask_oov=mask_oov, load_item_t1=True)
         # 进输入指纹：这些口径一变，x 的含义就变了，四个模型必须一致
-        self.params = {"max_hist": int(max_hist), "mask_oov_in_history": bool(mask_oov)}
+        self.params = {"max_hist": int(max_hist), "mask_oov_in_history": bool(mask_oov),
+                       "pair_features": bool(pair_features)}
+        # ---- user x author 偏好（§8.4）。按样本行对齐，不走行号间接 ----
+        self.pair = None
+        self.pair_cols: list[str] = []
+        if pair_features:
+            spec = json.loads((proc / f"pair_spec_{protocol}.json").read_text("utf-8"))
+            self.pair_cols = list(spec["columns"])
+            self.pair = np.load(proc / f"feat_pair_{split}_{protocol}.npy")
+            if self.pair.shape[1] != len(self.pair_cols):
+                raise AssertionError(
+                    f"pair 矩阵列数 {self.pair.shape[1]} 与 spec 的 {len(self.pair_cols)} 不符")
         s = pl.read_parquet(proc / f"samples_{split}_{protocol}.parquet",
                             columns=["video_id"])
         self.video_id = s.get_column("video_id").to_numpy().astype(np.int64)
+        if self.pair is not None and len(self.pair) != len(self.inner):
+            raise AssertionError(
+                f"pair 矩阵行数 {len(self.pair)} != 样本行数 {len(self.inner)} —— "
+                "两者不是同一次预处理的产物，按行号取会整体错位且不会报错")
         if len(self.video_id) != len(self.inner):
             raise AssertionError(
                 f"samples 行数不一致：video_id {len(self.video_id)} vs "
@@ -208,4 +227,6 @@ class RankingData:
         vid = self.video_id[rows]
         # item_idx（排序词表行号）与 video_id_known 都由排序静态表给出
         b.update(self.item_static.features(vid, self.inner.date[rows]))
+        if self.pair is not None:
+            b["pair"] = torch.from_numpy(self.pair[rows])
         return b

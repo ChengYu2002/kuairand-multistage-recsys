@@ -12,6 +12,11 @@ SEEDS=${SEEDS:-42}          # 开发期单 seed；正式实验 SEEDS="42 43 44"�
 # 验算紧跟生成：这张表错了不报错，只会让四个模型一起错到同一个方向。
 python -m src.features.rank_item_static  --config "$CFG"
 python scripts/verify_rank_item_static.py --config "$CFG"
+
+# ---- User x Author 偏好特征（plan §8.4）。补它是因为 is_follow 的 GAUC 只有 0.49014，
+# 用户内部排序≈随机 —— 模型没有任何 user x author 交互特征。
+python -m src.features.pair_preference    --config "$CFG"
+python scripts/verify_pair_preference.py  --config "$CFG"
 # 装载器只读，但搬错了不报错：行对齐与捷径扫描必须每次验
 python scripts/verify_ranking_data.py     --config "$CFG"
 

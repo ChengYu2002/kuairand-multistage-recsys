@@ -72,6 +72,8 @@ class SingleTaskDNN(nn.Module):
                          dropout=float(cfg.get("dropout", 0.0)))
 
     def forward(self, b: dict) -> dict[str, torch.Tensor]:
+        # batch 字典 → Encoder 拼成 (B, 323) → 上面MLP 输出 (B, 1) → squeeze 成 (B,)。
+        # 按任务名包装成字典，以便和后续返回多个任务的 MMoE / PLE 共用 Trainer 接口。
         return {self.task: self.tower(self.encoder(b)).squeeze(-1)}
 
 
@@ -107,6 +109,7 @@ def main() -> int:
     ic = require(cfg, "input")
     st = RankItemStatic(proc, a.protocol)
     dl = {"max_hist": int(ic["max_hist"]), "mask_oov": bool(ic["mask_oov_in_history"])}
+    # 数据装载
     tr = RankingData(proc, a.protocol, "train", st, **dl)
     va = RankingData(proc, a.protocol, "valid", st, **dl)
     te = RankingData(proc, a.protocol, "test", st, **dl) if a.eval_test else None
@@ -121,6 +124,13 @@ def main() -> int:
         set_seed(a.seed)
         model = SingleTaskDNN(tr, cfg, t)
         fp = model.encoder.fingerprint()
+#         res 里会保存：
+        # 训练 loss 曲线
+        # valid 的 AUC / GAUC / PCOC
+        # 训练时间
+        # 参数量
+        # 输入指纹
+        # 训练配置
         res = train(model, (t,), tr, va, te, cfg, a.seed, f"{tag}/{t}", fp,
                     eval_test=a.eval_test)
         per_task[t] = res

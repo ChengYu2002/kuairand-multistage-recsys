@@ -72,3 +72,9 @@ input:
   cat_dim: 8                   # 用户静态类别字段每个的 embedding 上限
   max_hist: 50
   mask_oov_in_history: true    # 历史池化时 PAD 与 OOV 一同 mask（口径与双塔一致）
+  pair_features: true          # 接入 user x author 偏好特征（plan §8.4，15 列）。
+                               # 加它的理由：Single-Task 在 valid 上 is_follow 的 GAUC 只有
+                               # 0.49014、is_comment 0.50537 —— 用户内部排序与随机无异，
+                               # 因为模型没有任何 user x author 交互特征。实测单特征
+                               # ua_imp_7d 的 GAUC 就有 0.53784 / 0.53764，打赢整个模型。
+                               # 关掉它可做消融；关掉会改输入指纹，所以不会被静默混用。

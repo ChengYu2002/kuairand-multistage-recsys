@@ -43,6 +43,9 @@
     tag_pool      tag_dim      标签 masked mean（test 覆盖 97%）
     user_t1       52           用户过去 1/3/7 天的行为统计
     item_t1       52           视频过去 1/3/7 天的统计（双塔刻意不要，排序要）
+    pair          15           user x author 过去 3/7 天的偏好（§8.4）。加它是因为
+                               is_follow 的 GAUC 只有 0.49014 —— 用户内部排序≈随机，
+                               而单特征 ua_imp_7d 就有 0.53784。
     user_static   4 + Σcat     静态画像：数值 + 25 个类别字段的 embedding
     tab, hour     4 + 4        曝光上下文
     numeric       4            duration(已标准化), age, log1p(hist_len), tag_len
@@ -80,6 +83,9 @@ def masked_mean(emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     m = mask.unsqueeze(-1).to(emb.dtype)
     return (emb * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+# 历史中只平均有效视频
+# 标签中只平均有效标签
+# PAD 和被 mask 的历史 OOV 不参与
 
 
 class RankingEncoder(nn.Module):
@@ -107,7 +113,9 @@ class RankingEncoder(nn.Module):
         # 两张表：历史走召回词表，目标走排序词表（理由见模块 docstring 的 P0 一节）
         n_hist = inner.item_tags.shape[0]           # 召回 video 词表行数
         self.hist_emb = nn.Embedding(n_hist, item_dim, padding_idx=0)
+        # hist_emb：历史视频，使用召回词表
         self.item_emb = nn.Embedding(st.n_videos_vocab, item_dim, padding_idx=0)
+        # item_emb：当前目标视频，使用排序词表
         self.author_emb = nn.Embedding(st.n_authors, self.author_dim, padding_idx=0)
         self.tag_emb = nn.Embedding(st.n_tags_vocab, self.tag_dim, padding_idx=0)
         self.cat_emb = nn.ModuleList(
@@ -126,7 +134,8 @@ class RankingEncoder(nn.Module):
         # 而 config 里写了却没接线的 bug 不会报错，只会让 YAML 变成装饰。
         self.data_params = dict(data.params)
         want = {"max_hist": int(ic["max_hist"]),
-                "mask_oov_in_history": bool(ic["mask_oov_in_history"])}
+                "mask_oov_in_history": bool(ic["mask_oov_in_history"]),
+                "pair_features": bool(ic["pair_features"])}
         if self.data_params != want:
             raise ValueError(
                 f"装载器口径 {self.data_params} 与 config input 段 {want} 不一致 —— "
@@ -134,6 +143,8 @@ class RankingEncoder(nn.Module):
             )
         self.n_user_t1 = inner.user_t1.shape[1]
         self.n_item_t1 = inner.item_t1.shape[1]
+        self.n_pair = 0 if data.pair is None else int(data.pair.shape[1])
+        self.pair_cols = list(data.pair_cols)
         self.n_static_num = inner.user_static_num.shape[1]
         self.n_cat = sum(e.embedding_dim for e in self.cat_emb)
         # 顺序即拼接顺序。写成表是为了 fingerprint 能把它序列化。
@@ -141,6 +152,7 @@ class RankingEncoder(nn.Module):
         # 只剩「这视频 train 期见过吗」，而它恰是 train/valid 强度差最大的通道（0.1174）。
         self.flag_keys = tuple(FLAG_KEYS) if self.use_item_id else tuple(
             k for k in FLAG_KEYS if k != "video_id_known")
+        # 323 维输入的目录
         self.channels: list[tuple[str, int]] = [
             ("hist_pool", item_dim),
             *([("item_id", item_dim)] if self.use_item_id else []),
@@ -148,6 +160,7 @@ class RankingEncoder(nn.Module):
             ("tag_pool", self.tag_dim),
             ("user_t1", self.n_user_t1),
             ("item_t1", self.n_item_t1),
+            *([("pair", self.n_pair)] if self.n_pair else []),
             ("user_static_num", self.n_static_num),
             ("user_static_cat", self.n_cat),
             ("tab", 4),
@@ -169,6 +182,7 @@ class RankingEncoder(nn.Module):
             "cat_sizes": [e.num_embeddings for e in self.cat_emb],
             "flags": list(self.flag_keys),
             "data_params": self.data_params,
+            "pair_cols": self.pair_cols,
             "forbidden_in_x": list(FORBIDDEN_IN_X),
             "id_dropout": self.id_dropout,
             "item_id_channel": self.use_item_id,
@@ -191,12 +205,14 @@ class RankingEncoder(nn.Module):
             item_channel = [self.item_emb(idx)]
         x = torch.cat(
             [
+                # 历史 ID 转成 embedding
                 masked_mean(self.hist_emb(b["hist"]), b["hist_mask"]),
                 *item_channel,
                 self.author_emb(b["author"]),
                 masked_mean(self.tag_emb(b["tags"]), b["tag_mask"]),
                 b["user_t1"],
                 b["item_t1"],
+                *([b["pair"]] if self.n_pair else []),
                 b["user_static_num"],
                 torch.cat([e(b["user_static_cat"][:, i]) for i, e in enumerate(self.cat_emb)],
                           dim=-1),
@@ -232,12 +248,15 @@ def mlp(in_dim: int, hidden: list[int], out_dim: int | None = None,
     """
     layers: list[nn.Module] = []
     d = in_dim
+    # hidden = [256, 128, 64]
     for h in hidden:
         layers += [nn.Linear(d, h), nn.ReLU()]
         if dropout > 0:
+            # Dropout 会在训练时随机把一部分神经元输出变成 0
             layers.append(nn.Dropout(dropout))
         d = h
     if out_dim is not None:
+        # 最终linear输出层
         layers.append(nn.Linear(d, out_dim))
     return nn.Sequential(*layers)
 
