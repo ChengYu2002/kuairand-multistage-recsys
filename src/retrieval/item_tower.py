@@ -36,8 +36,10 @@ def mlp(in_dim: int, hidden: list[int]) -> nn.Sequential:
     layers: list[nn.Module] = []
     d = in_dim
     for i, h in enumerate(hidden):
+        # 输入维度从d变成h 变小
         layers.append(nn.Linear(d, h))
         if i < len(hidden) - 1:
+            # 其他都加，就最后一层不加ReLu
             layers.append(nn.ReLU())
         d = h
     return nn.Sequential(*layers)

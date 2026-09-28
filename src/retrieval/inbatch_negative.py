@@ -24,12 +24,14 @@ import torch
 
 class InBatchNegative:
     name = "inbatch"
+    # 把当前 batch 里其他用户喜欢的视频，拿来当作这个用户的负样本
 
     def __init__(self, catalog_lo: int, catalog_hi: int) -> None:
         # 区间只用于断言：batch 里的正样本按 train_target_scope 已经限定在候选库内。
         self.lo, self.hi = int(catalog_lo), int(catalog_hi)
 
     def sample(self, batch: dict, n_neg: int, generator: torch.Generator) -> torch.Tensor:
+        # 先拿到当前 batch 的全部正视频：
         tgt = batch["target"]
         b = tgt.shape[0]
         if b < 2:

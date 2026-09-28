@@ -69,19 +69,33 @@ SAMPLERS = {"random": RandomNegative, "inbatch": InBatchNegative}
 class TwoTower(nn.Module):
     def __init__(self, data: RetrievalData, cfg: dict) -> None:
         super().__init__()
+        # 读取配置 维度
         tt = require(cfg, "two_tower")
         dim = tt["embedding_dim"]
+
+        # 创建贡献embadding表，根据 video_idx 查找视频向量的字典
         n_vocab = data.item_tags.shape[0]
         self.item_emb = nn.Embedding(n_vocab, dim, padding_idx=0)
+
         nn.init.normal_(self.item_emb.weight, std=0.01)
         with torch.no_grad():
             self.item_emb.weight[0].zero_()
+
+        # ItemTower
+        # video_idx
+           # ↓
+        # 共享 item embedding
+           # ↓
+        # MLP：256 → 128 → 64
+           # ↓
+        # 物品向量 v
         self.item_tower = ItemTower(
             self.item_emb, tt["item_tower_config"],
             n_authors=int(data.item_author.max()) + 2,
             n_tags=int(data.item_tags.max()) + 2,
             hidden=tt["item_tower_hidden"],
         )
+        # UserTower
         self.user_tower = UserTower(
             self.item_emb, n_t1=data.user_t1.shape[1],
             n_static_num=data.user_static_num.shape[1],
@@ -94,6 +108,7 @@ class TwoTower(nn.Module):
             raise ValueError(f"two_tower.temperature 必须 > 0，收到 {self.temperature}")
 
     def user_vec(self, b: dict) -> torch.Tensor:
+        # 把Tower的各种MLP输出 归一化。模型比较的是两个向量的方向是否接近，而不是谁的数值更大。
         return F.normalize(self.user_tower(b), dim=-1)
 
     def item_vec(self, b: dict) -> torch.Tensor:
@@ -101,12 +116,22 @@ class TwoTower(nn.Module):
 
     def loss(self, u: torch.Tensor, v_pos: torch.Tensor, v_neg: torch.Tensor,
              pos_ids: torch.Tensor, neg_ids: torch.Tensor) -> torch.Tensor:
+        """让每个用户在「1 个正视频 + n 个负视频」中选出正视频。"""
+
+        # 用户分别和正视频、负视频做点积；向量已经 L2 归一化，所以点积就是余弦相似度。
+        # 除以 temperature 只放大分数差距，不改变视频之间的排序。
         s_pos = (u * v_pos).sum(-1, keepdim=True) / self.temperature      # (B, 1)
         s_neg = torch.einsum("bd,bnd->bn", u, v_neg) / self.temperature   # (B, n_neg)
-        # accidental hit：负样本恰好是正样本本身，置 -inf 使其不进分母
+
+        # 如果负采样误抽到正视频本身，就把该位置设为 -inf，让它不参与 softmax。(e^{-inf}=0)
         s_neg = s_neg.masked_fill(neg_ids == pos_ids.unsqueeze(1), float("-inf"))
+
+        # 每行是一道分类题：[正视频, 负视频1, ..., 负视频N]。
+        # 正视频固定放在第 0 列，所以每行的正确答案都是 0。
         logits = torch.cat([s_pos, s_neg], dim=1)
         target = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+
+        # 推高正视频分数，同时压低负视频分数；返回整个 batch 的平均 loss。
         return F.cross_entropy(logits, target)
 
 
@@ -137,6 +162,23 @@ def item_matrix(model: TwoTower, data: RetrievalData, lo: int, hi: int,
         out[s : s + block] = v
     return out
 
+# 训练好的双塔模型
+#         ↓
+# 读取测试集的每个请求时刻
+#         ↓
+# 用户塔生成测试用户向量 U
+#         ↓
+# 物品塔生成候选库向量 V
+#         ↓
+# 计算分数 U × Vᵀ
+#         ↓
+# 每个请求取 Top-K 视频
+#         ↓
+# 映射成原始 video_id
+#         ↓
+# 传给 evaluate()
+#         ↓
+# 计算 Recall@K 和 NDCG@K
 
 @torch.no_grad()
 def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
@@ -148,13 +190,16 @@ def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
 
     tt = require(cfg, "two_tower")
     k_list = require(cfg, "eval", "k_list")
+    # Top XX
     k = max(k_list)
+    # 读取候选库和测试考题
     meta = json.loads((proc / f"vocab_meta_{protocol}.json").read_text("utf-8"))
     lo, hi = meta["video_catalog_index_min"], meta["video_catalog_index_max"]
     catalog = pl.read_parquet(proc / f"catalog_{protocol}.parquet")
     reqs = pl.read_parquet(proc / f"eval_requests_{protocol}.parquet")
 
     data = RetrievalData(proc, protocol, "test")
+    # 找到每道考题对应的样本行
     samples = pl.read_parquet(
         proc / f"samples_test_{protocol}.parquet", columns=["user_id", "video_id", "time_ms"]
     ).with_row_index("srow")
@@ -167,12 +212,14 @@ def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
     )
     if linked["srow"].null_count():
         raise AssertionError("有考题在 samples_test 里找不到对应行")
+    # 合并相同请求时刻
     mom = (
         linked.select("user_id", "time_ms", "srow", "date")
         .unique(subset=["user_id", "time_ms"], keep="first")
         .sort(["user_id", "time_ms"])
         .with_row_index("mrow")
     )
+    # 记录考题属于哪个请求时刻
     mid = (
         linked.select("user_id", "time_ms")
         .with_row_index("_j")
@@ -182,27 +229,31 @@ def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
     )
     log.info("考题 %s 条 -> 唯一查询时刻 %s 个", f"{len(reqs):,}", f"{len(mom):,}")
 
-    # 用户向量（按时刻）
+    # 1. 用训练好的用户塔，为每个测试请求时刻生成用户向量。
     srows = mom["srow"].to_numpy()
     parts = []
     for s in range(0, len(srows), 8192):
         parts.append(model.user_vec(data.batch(srows[s : s + 8192])).numpy())
     uv = np.vstack(parts)
 
-    # 物品向量：id_side 依赖请求日，必须按日各算一份
+    # 2. 用训练好的物品塔生成候选库向量；id_side 依赖请求日，必须按日各算一份。
     per_day = tt["item_tower_config"] == "id_side"
     dates = np.unique(mom["date"].to_numpy()) if per_day else [None]
     topk = np.empty((len(mom), k), np.int32)
     for d in dates:
         sel = np.arange(len(mom)) if d is None else np.flatnonzero(mom["date"].to_numpy() == d)
         iv = item_matrix(model, data, lo, hi, d)
+        # 3. 用户向量与全候选库计算点积分数，为每个请求保留 Top-K。
         idx, _ = topk_scores(uv[sel], iv, k=k)
         topk[sel] = idx
         del iv
     log.info("物品向量算了 %d 份（%s）", len(dates),
              "按评估日，因为 id_side 的 video_age 随日期变" if per_day else "与日期无关")
 
+    # 映射回原始 video_id
+    # 4. Top-K 目前是候选矩阵行号，先映射回原始 video_id。
     cat_ids = catalog.get_column("video_id").to_numpy()
+    # 5. 把预测 Top-K 和测试集真实答案交给统一 evaluate()，计算 Recall/NDCG。
     return evaluate(cat_ids[topk][mid], reqs.get_column("video_id"),
                     reqs.get_column("user_id").to_numpy(), k_list)
 
@@ -272,19 +323,33 @@ def main() -> int:
     model.train()
     t0, losses = time.perf_counter(), []
     for step in range(1, steps + 1):
+        # 1. 从全部训练正样本中随机抽一个 batch，再把行号对应的数据组装出来。
         pick = rows[rng.integers(0, len(rows), bs)]
         b = data.batch(pick)
+
+        # 2. 每条正样本抽 n_neg 个负视频。Random 和 In-batch 只在这里来源不同。
         neg_ids = sampler.sample(b, n_neg, gen)
+
+        # 3. 取出负视频特征。先拉平为 B*n_neg 条，日期也为每个负视频重复一次；
+        #    id_side 要用「请求日期 - 上传日期」计算 video_age。
         neg_feat = data.item_features(
             neg_ids.numpy().ravel(), np.repeat(data.date[pick], n_neg)
         )
+
+        # 4. 两座塔前向：得到用户、正视频和负视频的 64 维单位向量。
         u = model.user_vec(b)
         v_pos = model.item_vec(b)
         v_neg = model.item_vec(neg_feat).view(bs, n_neg, -1)
+
+        # 5. loss 只负责判分；backward 算梯度，step 才真正更新两座塔和 embedding。
         loss = model.loss(u, v_pos, v_neg, b["target"], neg_ids)
+        # 清理当前梯度
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        # Adam跟新update
         opt.step()
+
+        # 6. 保存当前 loss；每完成约 10% 时打印最近 100 步均值，减少单个 batch 的波动。
         losses.append(float(loss))
         if step % max(1, steps // 10) == 0 or step == steps:
             log.info("step %6d/%d  loss %.4f  (%.1fs)",

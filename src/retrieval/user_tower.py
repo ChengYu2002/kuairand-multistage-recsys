@@ -67,6 +67,7 @@ class UserTower(nn.Module):
         cat = torch.cat(
             [e(b["user_static_cat"][:, i]) for i, e in enumerate(self.cat_emb)], dim=-1
         )
+        # “拼接”就是把几个向量首尾相接，组成一个更长的向量
         x = torch.cat(
             [
                 self.pool_history(b["hist"], b["hist_mask"]),
