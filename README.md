@@ -3,11 +3,12 @@
 > Industrial-style multi-objective short-video recommendation system built on KuaiRand:
 > global temporal splitting, T-1 feature snapshots, two-tower retrieval, and multi-task ranking.
 
-**状态：🚧 Week 2 进行中 —— 召回主线已跑通，排序尚未开始。**
+**状态：🚧 Week 2 收尾 —— 召回主线与 Single-Task 排序基线均已跑通。**
 完整设计见本地个人笔记 `note/plan_architecture.md`（不入库）。
 
-已完成：数据管线、候选库与词表、召回指标、ItemCF、全库检索、双塔（random / in-batch）。
-未完成：Single-Task 排序基线、exposure / hybrid 负采样、MMoE / PLE / Selective Sharing。
+已完成：数据管线、候选库与词表、召回指标、ItemCF、全库检索、双塔（random / in-batch）、
+排序侧物品元数据、排序指标（AUC / GAUC / PCOC / 校准）、Single-Task 基线（单 seed，valid）。
+未完成：exposure / hybrid 负采样、MMoE / PLE / Selective Sharing、3 seeds、test 段评估。
 
 ---
 
@@ -168,14 +169,102 @@ Random 达到热度基线的 **1.81 倍**，In-batch 仅 1.08 倍。
 | ID-only | | | | |
 | ID + Side Features | | | | |
 
-### 7.3 Multi-task Ranking (mean ± std over 3 seeds)
+### 7.3 Multi-task Ranking
+
+**当前只有 Single-Task 基线（§27.1 里 ΔAUC 的分母），单 seed，只在 valid 上评估。**
+MMoE / PLE / Selective Sharing 未实现。test 只在架构与超参全部冻结后用一次 ——
+开发期反复看 test 会把它变成第二个 validation。
 
 | Model | Click AUC | Long-view AUC | Like AUC | Follow AUC | Comment AUC |
 |---|---:|---:|---:|---:|---:|
-| Single-Task | | | | | |
+| Single-Task | 0.73456 | 0.73742 | 0.91955 | 0.82617 | 0.88156 |
 | MMoE | | | | | |
 | PLE | | | | | |
 | Selective Sharing | | | | | |
+
+**只看上面这张表会得出错误结论。** 必须与 GAUC、PCOC 一并读：
+
+| task | 正样本率 | AUC | **GAUC** | PCOC | GAUC 参与用户 |
+|---|---:|---:|---:|---:|---:|
+| is_click | 45.28% | 0.73456 | 0.58538 | 1.116 | 985/988 |
+| long_view | 32.48% | 0.73742 | 0.61526 | 1.224 | 982/988 |
+| is_like | 2.17% | 0.91955 | 0.59232 | 1.425 | 780/988 |
+| is_comment | 0.37% | 0.88156 | **0.50537** | 1.823 | 452/988 |
+| is_follow | 0.11% | 0.82617 | **0.49014** | 1.827 | 395/988 |
+
+- **稀疏任务的高 AUC 主要来自用户之间的差异，不是「这个视频值得关注」。**
+  is_follow 的 GAUC = 0.49014、is_comment = 0.50537 —— 在**同一个用户内部**排序时与随机
+  无异。AUC 0.826 几乎全部来自模型学会了「哪些用户爱关注」。若只看 AUC 会得出
+  「follow 比 click 做得好得多（0.83 vs 0.73）」这个完全错误的结论。因此研究问题二真正
+  要看的是 **GAUC 有没有从 0.49 动起来**，而不是 ΔAUC 的绝对值。
+- **PCOC 随稀疏度单调恶化**：1.12 → 1.22 → 1.43 → 1.82 → 1.83。最稀疏的两个任务把概率
+  高估约 83%。AUC 只看排序不看数值，抓不到这件事 —— 而共享表示最可能让稀疏任务
+  **失准而非失序**，这是 §28 负迁移分析的抓手。
+- **GAUC 参与用户数必须与指标一起报**：985 → 982 → 780 → 452 → 395。标签恒定的用户
+  AUC 无定义，一律排除；follow 上只有 40% 的用户可算。
+- **只有 1 个 seed。** is_follow 的轮内曲线在 0.823~0.842 之间抖动（valid 仅 1,457 个正
+  样本），单 seed 的 0.01 差异读不出任何东西。§26 要求的 3 seeds + mean ± std 必须补齐
+  后才能谈 follow / comment 上的迁移。
+
+#### 物品侧在测试期几乎是空的
+
+排序训练在曝光日志上，而本数据集内容换代极快（72.6% 的视频在 31 天窗口内上传）。
+实测测试段的物品侧覆盖率：
+
+| 标签 | 时长 | 上传日期（→ video age） | 作者 | **目标视频 ID** |
+|---:|---:|---:|---:|---:|
+| 96.6% | 93.3% | ~100% | 64.1% | **10.8%** |
+
+视频 ID 有 89.2% 对不上，这**修不了也不该修**：昨天刚上传的视频不可能有学过的专属向量。
+模型从「不知道是什么」变成「不知道是哪一个，但知道谁拍的、什么类、多长、多新」——
+这正是真实系统处理新视频的方式。为此排序侧单独建了一张物品元数据表（只用合法的 basic
+元数据，官方统计表全表禁用），三个词表全部只由 train 段构建，召回侧文件一个字节未改。
+
+#### 一条已修的捷径，一条残留的漂移
+
+**已修**：目标视频 ID 最初沿用召回词表，而召回词表 =「候选库 ∪ train 段正向视频」——
+成员身份**部分由训练标签决定**。实测 train 段 962,054 条 OOV 样本里 is_click 与 long_view
+的正样本率**恰好为 0**（任何正样本都会把该视频送进词表），于是「在词表内」这一个比特
+单独就有 train AUC 0.6981 / test 0.5190。is_like 不受影响（0.5043），因为召回词表的
+positive_signal 只含 is_click 与 long_view —— 机制完全对得上。目标通道已换成只由 train
+曝光次数构建的词表（194,310 个，与候选库逐个相同）；历史通道仍用召回词表，两者各一张
+embedding 表。
+
+**残留（披露而非掩盖）**：新的 `video_id_known` 仍带轻微热度信号，train 0.5509 /
+valid 0.5248（强度差 0.026）。它是合法的 prediction-time 特征（train 期曝光相对 test
+是过去数据），但差距不为零。对比修复前的 0.179，性质不同。验算里有一层常设的**捷径
+扫描**：先实测哪些通道真的进了模型，再比 train/valid 单特征 AUC 强度，超 0.15 报错、
+0.05~0.15 逐条打印披露。
+
+#### 过拟合位置与训练预算
+
+原设置（5 轮、无正则）下 valid AUC 从第 1 轮起单调下滑，is_follow 更是从峰值掉 0.0915。
+逐个消融后定位到**历史 embedding**（897,505 行 × 32 = 2,870 万参数，占 77%）：
+
+| 手段 | 打在哪 | is_click 1 轮末 AUC | 有效 |
+|---|---|---:|---|
+| 基准 | — | 0.72780 | — |
+| dropout=0.2 | 塔（12 万参数） | 0.72734 | ✗ |
+| id_dropout=0.3 | 目标 ID（620 万） | 0.72864 | ✗ |
+| 去掉整条目标 ID 通道 | — | 0.72817 | ✗ |
+| lr 1e-3 → 3e-4 | — | 0.72503 | ✗ 更差 |
+| **weight_decay=1e-5** | **全部 embedding** | **0.73372** | ✓ |
+
+预算（epochs=1 / weight_decay=1e-5）一次性在 **valid** 上选定，四个模型共用同一套值，
+完整依据写在 `configs/single_task.yaml` 的注释里。取 1e-5 而非 1e-4 是因为后者在 is_follow
+上掉 0.024 —— 只看 is_click 会选错。顺带结论：目标 ID 通道对 valid AUC 的贡献≈0（拿掉
+只动 0.0004），与它在 test 段 89.2% 是 OOV 一致；保留它是为了与 MTL 对比时结构一致。
+
+#### 一个必须披露的不对称
+
+Single-Task 是 5 个**完全独立**的模型（不共享 embedding），MMoE / PLE / Selective 是 1 个
+模型带 5 个头。因此总计算量与参数量都差约 5 倍 —— 这是「共享 vs 不共享」这个比较的固有
+形态，不是算力对齐实验。§25.1 里 Single-Task 是**参照点**，参数预算可比性只在三个 MTL
+变体之间要求。
+
+**checkpoint 选择必须对称**：ST 可以为 5 个任务各挑一次最佳轮，MTL 只能挑一次；若允许
+ST 挑 5 次，ΔAUC 会系统性偏向 ST、凭空造出负迁移。因此四个模型一律**固定轮数、报最后
+一步**，每 500 步记曲线但不据此选择。
 
 ### 7.4 Controlled Label Sparsity
 
