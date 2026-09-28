@@ -36,6 +36,11 @@ def other_key(key: str) -> str:
     return "video_id" if key == "user_id" else "user_id"
 
 
+def _keys(key: str | list[str]) -> list[str]:
+    """允许复合键。传 str 时与原来逐字等价（§8.4 的 user x author 是一对，不是单列）。"""
+    return [key] if isinstance(key, str) else list(key)
+
+
 def _offsets(w_max: int) -> pl.DataFrame:
     return pl.DataFrame({"offset": list(range(1, w_max + 1))}, schema={"offset": pl.Int32})
 
@@ -47,36 +52,62 @@ def _project(df: pl.DataFrame, w_max: int) -> pl.DataFrame:
     )
 
 
-def daily_aggregate(lf: pl.LazyFrame, key: str, labels: list[str]) -> pl.DataFrame:
-    """按 (key, date) 聚合每日计数。"""
+def daily_aggregate(lf: pl.LazyFrame, key: str | list[str],
+                    labels: list[str]) -> pl.DataFrame:
+    """按 (key..., date) 聚合每日计数。key 可以是复合键。"""
+    ks = _keys(key)
     aggs = [pl.len().alias("imp")] + [pl.col(c).sum().alias(c) for c in labels]
-    return lf.group_by([key, "date"]).agg(aggs).sort([key, "date"]).collect()
+    return lf.group_by([*ks, "date"]).agg(aggs).sort([*ks, "date"]).collect()
 
 
-def distinct_pairs(lf: pl.LazyFrame, key: str) -> pl.DataFrame:
-    """去重后的 (key, other, day) 三元组，供真实 distinct 统计使用。"""
-    return (
-        lf.select([key, other_key(key), to_date().alias("d")]).unique().collect()
-    )
+def distinct_pairs(lf: pl.LazyFrame, key: str | list[str],
+                   other: str | None = None) -> pl.DataFrame:
+    """去重后的 (key..., other, day) 三元组，供真实 distinct 统计使用。
+
+    other 显式给出时用它；否则沿用 other_key(单列 key) 的老行为。
+    user x author 这类复合键必须显式传 —— other_key 对非 "user_id" 的键一律返回
+    "user_id"，而"一个 (用户,作者) 对涉及多少个不同用户"恒等于 1，是个死列。
+    """
+    ks = _keys(key)
+    oth = other if other is not None else other_key(ks[0] if len(ks) == 1 else "")
+    return lf.select([*ks, oth, to_date().alias("d")]).unique().collect()
 
 
 def rolling_features(
     daily: pl.DataFrame,
     pairs: pl.DataFrame,
-    key: str,
+    key: str | list[str],
     prefix: str,
     labels: list[str],
     windows: list[int],
     smooth_alpha: float,
     global_rates: dict[str, float],
+    other: str | None = None,
+    rate_labels: list[str] | None = None,
+    need_keys: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
+    """key 可以是复合键。
+
+    other       distinct 统计针对哪一列（复合键必须显式传，见 distinct_pairs）。
+    rate_labels 只为这些标签产出比率列。默认全部 —— 但 pair 维度上曝光量只有 0~4，
+                给 0.1% 的事件算比率是纯噪声，所以 §8.4 只给密集信号算。
+    need_keys   只保留样本真正需要的 (key..., target) 键。user x author 的投射是
+                5,860 万行、若照搬全宽会到 10 GB；semi-join 砍到 train 实际用到的
+                417 万个键之后才装得下。语义上无损：聚合本就是按 (key..., target)
+                分组，整组丢掉不影响其余组。
+    """
     """展开成各窗口的滚动统计；返回的 date 表示「适用于哪一天的样本」。"""
+    ks = _keys(key)
+    oth = other if other is not None else other_key(ks[0] if len(ks) == 1 else "")
+    rates_for = labels if rate_labels is None else rate_labels
     w_max = max(windows)
     # 要统计曝光加五类行为。
     counts = ["imp", *labels]
 
     # 投射每日统计
     projected = _project(daily.with_columns(to_date().alias("d")).drop("date"), w_max)
+    if need_keys is not None:
+        projected = projected.join(need_keys, on=[*ks, "target"], how="semi")
 
     # 先把计算规则放进 aggs
     aggs: list[pl.Expr] = []
@@ -91,26 +122,29 @@ def rolling_features(
     aggs.append((pl.col("imp") > 0).sum().alias(f"{prefix}_active_days_{w_max}d"))
 
     # 这里开始真正计算
-    out = projected.group_by([key, "target"]).agg(aggs)
+    out = projected.group_by([*ks, "target"]).agg(aggs)
 
     # 用户过去7天看过多少个不同视频，或者视频过去7天触达了多少个不同用户
     # 真实的 w_max 天 distinct：对去重三元组做投射后 n_unique，
     # 而不是把每日 distinct 相加（跨天重复会被重复计数）。
+    dist_src = _project(pairs, w_max)
+    if need_keys is not None:
+        dist_src = dist_src.join(need_keys, on=[*ks, "target"], how="semi")
     dist = (
-        _project(pairs, w_max)
-        .group_by([key, "target"])
-        .agg(pl.col(other_key(key)).n_unique().alias(f"{prefix}_distinct_{w_max}d"))
+        dist_src
+        .group_by([*ks, "target"])
+        .agg(pl.col(oth).n_unique().alias(f"{prefix}_distinct_{w_max}d"))
     )
 
     # left join: 以原来的 out 为主，保留它的全部行，再把匹配到的 distinct 列补进来
-    out = out.join(dist, on=[key, "target"], how="left")
+    out = out.join(dist, on=[*ks, "target"], how="left")
 
     # 比率列：朴素 + 贝叶斯平滑。稀疏 key 的朴素比率几乎是噪声
     # （曝光 1 次点击 1 次 -> 1.0），平滑后被拉回全局先验。
     ratio: list[pl.Expr] = []
     for w in windows:
         imp = pl.col(f"{prefix}_imp_{w}d")
-        for c in labels:
+        for c in rates_for:
             num = pl.col(f"{prefix}_{c}_{w}d")
             # 原始行为率：行为次数 / 曝光次数；
             # 如果窗口内没有曝光，则行为率为 null。
@@ -149,12 +183,13 @@ def rolling_features(
 
     # 找出所有 user_ / item_ 特征列，
     # 排除实体主键和目标日期，供最终输出统一选列。
-    feat_cols = [c for c in out.columns if c.startswith(prefix) and c not in (key, "target")]
+    feat_cols = [c for c in out.columns
+                 if c.startswith(prefix) and c not in (*ks, "target")]
 
     # 整理最终输出：保留实体 ID，将目标日恢复为 YYYYMMDD 格式，
     # 加入全部特征列，并按实体和日期排序。
     return out.select(
-        pl.col(key),
+        *[pl.col(k) for k in ks],
         pl.col("target").dt.strftime(_FMT).cast(pl.Int32).alias("date"),
         *feat_cols,
-    ).sort([key, "date"])
+    ).sort([*ks, "date"])

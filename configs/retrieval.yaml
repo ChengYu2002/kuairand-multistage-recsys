@@ -1,40 +1,229 @@
 # Two-Tower / ItemCF 召回。负采样对比必须固定除策略外的所有变量（plan §16.6）。
 data_config: configs/data.yaml
 
-# 候选库（plan §14）—— 数字来自 results/schema_report.md
-# 全量 item 空间 437 万，但 65% 只出现过一次，直接在全库上评估会让四种策略全部掉进噪声。
-# 测试期正样本 item 仅 26.9% 在训练期出现过（信息流以新内容为主，72.6% 的视频窗口期内上传）。
+# 候选库（plan §14）—— 数字为 build_catalog.py 实测，非估计值。
+# 全量 item 空间 437 万（含从未曝光者）；主建模范围 tab 1/2/4 内 313.7 万，
+# 其中 64.1% 只出现过一次。直接在全库上评估会让四种负采样策略全部掉进噪声。
 catalog:
   protocol: A                    # A = warm（训练期见过）, B = time-aware available（含未见新 item）
-  min_train_freq: 5              # 主协议：19.4 万 item / 6.65 万 request，覆盖 12.3% 的测试正 item
-  upload_rule: strict_before     # upload_date < request_date（upload_dt 仅日期粒度）
-  # 辅助设定：min_train_freq=1 -> 170.9 万 item / 12.0 万 request，更难，验证结论稳定性。
-  # 门槛会使候选库偏向较热门 item，README 必须披露（§14.4）。
+  train_splits: [train]          # 频次只数这几段 —— 必须显式写死，不能靠默认值。
+                                 # README §6 曾写作「train/val」，以此处为准：valid 保持
+                                 # 干净调参集的身份，不参与候选库构建。
+                                 # 若改成 [warmup, train]，候选库会变成 28.2 万 item，是另一套口径。
+  min_train_freq: 5              # 主协议：19.4 万 item / 6.65 万 request
+  aux_min_train_freq: 1          # 辅助协议：170.9 万 item / 12.0 万 request，验证结论是否随门槛变化
+  eval_split: test               # request 取自哪一段
+  upload_rule: strict_before     # upload_date < request_date（upload_dt 仅日期粒度）。Protocol B 用，未实现。
+  # 门槛使候选库偏向较热门 item，README 必须披露（§14.4）。
+  # 关键限制：门槛把 request 覆盖率从 21.9% 压到 12.1%（少 53,879 个 request，9.8 个百分点）；
+  # 但 21.9% 这个上限与门槛无关 —— 测试期 78.1% 的正向事件，其目标 item 在训练段一次都
+  # 没出现过。即门槛的影响与天花板是两件事。天花板由「训练期见过」这一前提本身造成，
+  # 调门槛突破不了，只能靠 Protocol B + 带 side feature 的物品塔（§7.2 那张表因此是必答题）。
+
+  # 口径回归锁 —— 这些不是参数，是「这套口径应当产出什么」的冻结实测值。
+  # 动机：Week 3/4 的四种负采样、四种共享机制全部建立在同一个候选库上，口径被
+  # 误改而无人察觉，会让所有对比一起失效且看不出异常。verify_catalog.py 逐项断言。
+  # 换数据集时必须替换成该数据集自己的实测值，不能删 —— 删掉等于没有保护，
+  # 而 run_preprocess.sh 带 --require-golden，缺这一段会直接失败。
+  expected:
+    dataset: KuaiRand-1K
+    train_seen_items: 1708902        # 训练段出现过的 item
+    eval_positive_events: 550316     # test 段正向事件总数（= request 覆盖率的分母）
+    main_catalog_size: 194310
+    main_eligible_requests: 66536
+    aux_catalog_size: 1708902
+    aux_eligible_requests: 120415
+
+# ID 词表（plan §13）—— 把 video_id / author_id / tag 换算成连续行号。
+# 必须落盘：若重算时顺序变化，checkpoint 里「第 N 行」学到的东西就会对应到另一个实体。
+# 这不会报错，只会让指标莫名其妙变差，是最难查的一类问题。
+#
+# 统一约定：index 0 恒为 PAD（历史序列补齐用），index 1 恒为 OOV（字段缺失或未进词表）。
+#
+# ⚠ padding_idx=0 **不能替代 mask**。它只保证 PAD 那一行恒为零向量且不回传梯度，
+#   但 history_emb.mean(dim=1) 仍然会把 PAD 算进分母 —— 历史 5 条和 50 条会差 10 倍尺度。
+#   而本数据集训练时平均 49.7/50 条可编码、测试时只有 8.75/50，训练与测试的尺度会系统性错位。
+#   用户塔必须自己做 masked sum / valid_len，不能图省事直接 mean。
+vocab:
+  video:
+    # 候选集合与「历史可编码集合」是两个不同的问题，不能混：
+    #   候选库  = 模型可以召回哪些视频（freq>=5 的门槛是为了让负采样对比可测）
+    #   词表    = 用户历史里的视频怎么编码（用上面那个门槛毫无道理）
+    # 实测混为一谈的代价（两种分母都列出来，混用会得到对不上的数字）：
+    #   按评估用查询时刻（51,746 个，= 上报 Recall 的口径）
+    #       catalog 16.10% 可编码 / 平均 8.04/50 / 空历史 1.80%
+    #       并集    24.11% 可编码 / 平均 12.05/50 / 空历史 0.37%
+    #   按 test 段全部曝光时刻
+    #       catalog 11.13% / 5.56/50 / 空 8.05%      并集 17.50% / 8.75/50 / 空 2.76%
+    #   训练段（并集）：99.41% 可编码，平均 49.67/50
+    #
+    # 布局：index 2~194,311 依候选库顺序（train_freq desc, video_id asc），
+    # 194,312~897,504 是仅出现在历史里的 item（按 video_id 升序，共 703,193 个）。
+    # 物品塔打分直接切 [2 : 194,312] 连续区间，召回范围不受词表扩大影响。
+    source: catalog_union_train_positive
+    history_splits: [train]  # 并进词表的「仅历史」视频取自哪几段。独立于 itemcf.profile_splits ——
+                             # 双塔的词表不该由 ItemCF 的配置控制。
+    oov: true                # index 1 留给 OOV。**必须留**：否则 mapping.get(vid, 1) 会把
+                             # 未知视频静默当成 index 1 那个真实视频，不报错、查不出来。
+                             # OOV 只用于**编码历史**，永远不作为训练目标 —— 目标不在词表的
+                             # 训练正样本仍然直接丢弃，所以不会出现「所有正样本学到同一个
+                             # OOV 向量」那种污染。用户塔 pooling 时把 OOV 与 PAD 一并 mask。
+                             # 新增的 703,193 个里有 702,740 个（99.9%）出现在训练历史中，
+                             # 中位 20 次、99.6% >=5 次，能吃到梯度；但这些出现高度相关
+                             # （同一用户的连续窗口），有效信号约等于接触过它的不同用户数，
+                             # 而它们训练期曝光 <5 次，所以很薄，别指望学得好。
+  author:
+    min_videos: 2            # 候选库内至少 2 个视频才单独建 index，其余并入 OOV。
+                             # 实测 94,113 个作者对 194,310 个视频，中位每人仅 1 个 —— 单视频作者的
+                             # embedding 只是 video 向量的复制品，没有泛化价值，反而增加过拟合面。
+                             # >=2 保留 31,529 人（33.5%），覆盖 67.8% 的候选视频。
+    oov: true
+  tag:
+    min_videos: 1            # 候选库内只有 48 个不同 tag，属低基数类别，无需门槛。
+    oov: true                # 2.079% 的候选视频没有 tag
+  # 口径回归锁 —— 与 catalog.expected 同样的动机：词表一旦被改动，checkpoint 会静默失效。
+  # 换数据集时必须替换成该数据集自己的实测值，不能删（verify_vocab.py 带 --require-golden）。
+  expected:
+    video_entities: 897503
+    video_rows: 897505          # 含 index 0 (PAD) 与 index 1 (OOV)，建 nn.Embedding 用这个数
+    video_catalog_index_min: 2        # 打分时切 [2 : 194312]
+    video_catalog_index_max: 194311
+    author_entities: 31529
+    author_rows: 31531          # 含 PAD 与 OOV
+    tag_entities: 48
+    tag_rows: 50
+
+  # 侧信息缺失率（候选库内实测）：author_id 0%，tag 2.079%，upload_dt 0.002%，video_duration 4.809%。
+  # 每视频 tag 数中位 1、最大 4，多 tag 占 14.0%（全量视频表为 22.3% / 58 个 tag；
+  # data.yaml 里记的 24.7% 来自 1,000 条抽样，以此处实测为准）。
+
+# 物品静态属性（阶段 0 的 ② video_age / ③ tag multi-hot）。
+# age 不落盘 —— 它随请求日变化，而物品向量要离线算一次建索引。只存 upload_date，
+# age 由使用方现算（src.features.video_age.age_days）。
+item_static:
+  # 已知问题：曝光记录的中位 age 在 train 段 2 天、valid 12 天、test 23 天。
+  # 成因有三层叠加 —— 词表固定为 warm 集合、评估只保留其中可编码的部分、以及视频本身
+  # 随时间自然变老。这是**条件分布**的变化，不代表原始视频总体发生了异常漂移。
+  # 但后果是实在的：物品塔若用 age，会在 age≈2 上训练、在 age≈23 上评估，必须在报告中披露。
+  expected:
+    rows: 897503
+    missing_upload_date: 18
+    missing_tag: 26771
+    missing_duration: 64045
+    author_oov: 589401
+    max_tags_per_video: 5
+    max_age_days: 1190          # 词表可编码曝光实测（4,809,007 条，非全部 901.5 万条）；最小 0，无负值
+
+# 特征编码（阶段 0 的 ⑤）。
+encoder:
+  stats_basis: train_samples   # 归一化统计量按什么加权。
+                               #   train_samples —— 按 train 段**曝光样本**统计（含冷启动样本）。
+                               #     这是模型实际吃到的分布，标准化的本意就是把它压到 0/1。
+                               #   entity_date   —— 按唯一 (实体, 日期) 特征行等权。描述的是
+                               #     特征表本身，而同一行会被多个样本重复读取，
+                               #     因此模型看到的并不是 0/1。实测差距很大：
+                               #       item_imp_7d 按特征行等权 -> 样本上 mean -0.32 / std 2.16
+                               #       user_imp_7d 按特征行等权 -> 样本上 mean  0.71 / std 0.81
+                               # 冷启动样本**计入**统计：56.3% 的输入本来就是冷启动行，
+                               # 把它们排除掉，标准化就不再描述真实输入分布。
 
 two_tower:
   embedding_dim: 64
-  user_tower_hidden: [256, 128, 64]
+  user_tower_hidden: [256, 128, 64] # 用户塔和物品塔的 MLP 层宽：先输出 256 维，再压到 128，最终输出 64 维
   item_tower_hidden: [256, 128, 64]
-  item_tower_config: id_only     # id_only | id_side
+  item_tower_config: id_only     # id_only | id_side。两者共用同一个 MLP 结构，只有输入特征不同 ——
+                                 # 否则 §7.2 的对比会同时差了特征与深度，无法归因。
+  share_item_embedding: true     # 物品塔与用户塔共用一份 item embedding。词表取并集的理由正在于此：
+                                 # 只出现在历史里的 70.3 万个 item 也能吃到梯度。
+  mask_oov_in_history: true      # 历史池化时 OOV(index 1) 与 PAD(0) 一同 mask。
+                                 # 评估时 82.5% 的历史条目是 OOV，不 mask 会让池化被同一个向量主导。
+  empty_history: zero_vector     # hist_len=0 时历史通道输出零向量（不除零、不退化成 OOV 向量）。
+                                 # 模型靠 hist_len 与 user_has_history 区分「没有兴趣可读」。
   optimizer: adam
   lr: 0.001
   batch_size: 1024
   max_steps: 20000               # 固定步数而非 epochs —— 换数据集时训练量才可比（§16.6）
   negatives_per_positive: 10
+  temperature: 0.05              # 点积除以它再进 softmax。L2 归一化后点积落在 [-1,1]，
+                                 # 不除的话 logits 太平、梯度太小。
+  train_target_scope: catalog    # 训练正样本的目标取自 catalog 还是 vocab。
+                                 # **必须与负样本同一个空间**，否则会制造一条捷径：
+                                 # 若正样本可以在 vocab 任意位置、负样本却只来自候选库，
+                                 # 那么「不在候选库」就完美预测「是正样本」（占 42%），
+                                 # 而候选库成员身份恰好由 index 区间编码，模型学得到。
+                                 # 选 catalog 的代价：训练正样本从 208 万降到 121 万（-42%）。
+                                 # 但那 42% 的 item 仍会通过用户塔的历史池化吃到梯度，
+                                 # 并非完全浪费；而 121 万 x 17 遍（2 万步 x 1024）也够训。
 
 negative_sampling:
   strategy: random               # random | inbatch | exposure | hybrid
   hybrid_mix: {random: 0.5, exposure: 0.5}
   logq_correction: false         # P1
+  # 统一接口（Week 3 插 exposure / hybrid 时不得改动其他任何代码）：
+  #   sample(batch, n_neg, generator) -> LongTensor (B, n_neg)，元素是词表行号
+  # 采样空间一律是候选库区间 [2, 194311] —— 见 two_tower.train_target_scope 的理由。
+  # 「负样本恰好等于正样本」由损失函数统一屏蔽（accidental hit），不要求采样器自己规避：
+  # 四种策略的规避难度不同，放在损失里才能保证它们面对完全一样的处理。
 
+# ItemCF（plan §16）。两个矩阵必须分开，混为一谈会得到完全不同的实验：
+#   M —— 学 item-item 相似度用，必须用 train 段**全部**正向行为。限制成最近 50 会让
+#        共现从 12.07 亿对掉到 124 万对，绝大多数 item 对变成零共现，相似度表形同虚设。
+#   H —— 打分时的查询历史，取 request 时刻**严格之前**的行为。这一份要和双塔对齐，
+#        否则 ItemCF vs 双塔的差异分不清来自模型还是来自输入。
 itemcf:
-  similarity: normalized_cooccurrence
-  topk_similar: 100
-  topk_recall: 500
-  # 预期表现不佳：1000 用户 / 437 万 item，多数 item 仅被一个用户看过，共现矩阵极稀疏。
+  similarity: cosine             # |Ui∩Uj| / sqrt(|Ui|·|Uj|)
+  profile_splits: [train]        # M 的来源段
+  history: recent50              # H 的口径：recent50 | all_before
+  history_max_len: 50            # recent50 时的上限；all_before 时忽略（实测中位 4,271）
+  iuf: false                     # 活跃用户惩罚 1/log(1+|Iv|)，作为独立消融而非默认
+  zero_self_similarity: true     # sim(j,j)=0。不置零的话 50 个历史 item 会自带满分霸占榜首，
+                                 # 而正确答案是已看 item 的只占 0.04%，纯属浪费坑位。
+                                 # 这是相似度定义的一部分，不是「排除已看视频」的后处理。
+  topk_similar: 100              # 每个历史 item 只为它最相似的 100 个候选投票
+  sim_decimals: 9                # 排序前把相似度/得分量化到这么多位小数。
+                                 # 必须有：数学上相等的相似度（如 3/√27 与 2/√12 同为 1/√3）
+                                 # 在浮点下会差 1 个 ULP，单个 item 就能有上百个这样的值挤在
+                                 # 截断边界上。不量化的话「谁进 top-100」由浮点噪声决定，
+                                 # 换 BLAS 或换机器结果就会变，可复现性形同虚设。
+  topk_recall: 500               # 必须 >= max(eval.k_list)
+  pad_order: catalog_asc         # 非零候选不足 topk_recall 时的补位顺序。
+                                 # 零分候选本质上全部并列，必须与「并列取下标小者」一致，
+                                 # 即 catalog_asc。改成 catalog_desc 可报告该选择的敏感性
+                                 # （实测影响 13.28% 的查询时刻，Recall@500 差约 5%）。
+  sim_block: 2000                # 相似度分块行数
+  score_block: 2000              # 打分分块的查询时刻数
+  # 截断之后全程稀疏：每个 request 的候选上限 = history_max_len x topk_similar = 5,000，
+  # 因此不存在 51,746 x 194,310 的稠密打分矩阵。all_before 那版才需要认真分块。
+  # 不足 topk_recall 时按 pad_order 补位，默认 catalog_asc（热门优先）—— 零分候选本质上
+  # 全部并列，补位顺序必须与「并列取下标小者」一致。实测 13.28% 的查询时刻会走到补位，
+  # 这部分 Top-K 不由 ItemCF 决定，报告中必须与补位率一并披露。
+  #
+  # 三个版本的定位（不跑 2x2 四格）：
+  #   ItemCF-50      recent50   + cosine       主基线
+  #   ItemCF-All     all_before + cosine       历史长度消融
+  #   ItemCF-50-IUF  recent50   + cosine+IUF   活跃度惩罚消融
+  #
+  # 预期表现不佳：993 用户 / 19.4 万候选，多数 item 仅被 6.2 个用户看过，共现极稀疏。
   # 这是数据 regime 决定的，不是实现问题，README 中作为观察记录。
 
 eval:
   k_list: [50, 100, 500]
   request_unit: positive_event   # 测试窗内每个正向事件 = 一个 request（§15）
-  report_per_user_average: true  # 用户活跃度差 1000 倍（116 ~ 127,557），需同时报按用户平均
+  positive_signal: [is_click, long_view]
+  # positive_signal 与 data.yaml 的 history.positive_signal 目前一致，但独立可配：
+  # 改历史序列口径不应该静默改掉评估协议。
+  report_per_user_average: true  # 用户活跃度差 7,900 倍（16 ~ 125,944 条曝光），需同时报按用户平均
+
+  # 尺子的校准靶 —— 热度基线（Protocol A，所有 request 推同一份榜单）在本实现下的实测值。
+  # 动机：retrieval_metrics 是 ItemCF / 双塔 / 四种负采样共用的唯一度量入口，它一旦算错，
+  # 所有模型会**一起**错到同一个方向，对比看上去依然正常。因此必须有一个与模型无关、
+  # 可独立重算的定点把实现钉住。verify_retrieval_metrics.py 逐项断言（容差 1e-6）。
+  # 注意 recall@500 依赖候选库排序：第 500 名 train_freq=114，17 个并列（排名 488~504），
+  # 顺序变了这个数就变 —— verify_catalog 的 A 层有对应的落盘顺序断言。
+  expected_popularity_baseline:
+    recall@50:  0.002224
+    recall@100: 0.004900
+    recall@500: 0.023010
+    ndcg@50:    0.000588
+    ndcg@100:   0.001013
+    ndcg@500:   0.003279

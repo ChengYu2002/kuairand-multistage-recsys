@@ -39,7 +39,13 @@ history:
 features:
   snapshot: T-1            # Day T 样本只允许使用 <= T-1 的聚合
   windows: [1, 3, 7]
-  tag_is_multivalue: true  # tag 为逗号分隔，24.7% 的视频有多个 tag，需 multi-hot
+  smooth_alpha: 20.0       # 贝叶斯平滑强度（虚拟曝光次数）。原本只是 _driver.py 的 argparse
+                           # 默认值，没有进 config —— 换数据集时会静默沿用。
+                           # 平滑率 = (num + alpha*g) / (imp + alpha)，g 为 warmup 段先验。
+                           # 编码器填充缺失的平滑率时必须用同一个 g（num=imp=0 时公式恰好等于 g）。
+  tag_is_multivalue: true  # tag 为逗号分隔，需 multi-hot。全量视频表实测 22.3% 多 tag / 58 个 tag；
+                           # 候选库内 14.0% / 48 个 tag（以此为准，见 retrieval.yaml 的 vocab 段）。
+                           # 原记的 24.7% 来自 1,000 条抽样，已作废。
   upload_dt_has_time: false  # 仅日期粒度 -> 候选库用 upload_date < request_date（§14.1）
 
 # 正样本率实测（限定 tab 1/2/4，共 901.5 万行）
@@ -63,3 +69,75 @@ leakage:
   # video_features_statistic_*.csv 全表禁用：官方说明其为「整月每日平均」，
   # 对任一天的样本都含未来信息（§7.2）。物品统计特征一律从 past-only 日志自建。
   excluded_files: [video_features_statistic]
+
+# ---- 排序侧专用物品元数据（Track B，plan §20）----
+# 为什么另建一套而不复用召回的词表：召回的 video / author / tag 词表是按 Protocol A
+# 「训练期候选库」建的，那对召回是正确的。但排序训练在曝光日志上，实测测试段 83.2% 的
+# 曝光其 video_id 不在召回词表里，其中 53.2% 连 T-1 统计也没有 —— 物品侧等于全空。
+# 而作者 / 标签 / 时长 / 上传日期在曝光发生之前就已存在，是合法的 prediction-time 特征。
+#
+# 硬隔离：本节产出全部是新文件。召回的词表、静态表、checkpoint 一个字节都不动 ——
+# 一旦 author 词表的「第 N 行是谁」变了，已训好的双塔 checkpoint 会静默作废：不报错，
+# 只是指标莫名变差。scripts/freeze_manifest.py --check 负责把这件事变成可断言的。
+#
+# 放在 data.yaml 而不是各模型 config 里，是因为 single_task / mmoe / ple / selective
+# 都通过 data_config 继承这里的同一份口径。§27.1 的 ΔAUC 要求四个模型除共享机制外
+# 完全一致，元数据口径各写一套就会悄悄分叉。
+rank_item:
+  source: video_features       # 只用 basic 元数据。statistic 表已列在 leakage.excluded_files
+  vocab_basis: train_samples   # 词表只能由 train 段样本构建；valid/test 未见过的一律 OOV
+  author_min_count: 5          # 训练期曝光次数门槛。实测（1K，对 test 曝光的作者覆盖率）：
+                               #   >=1   660,563 作者   test 覆盖 77.9%   embedding 10.6M 参数
+                               #   >=5   158,251 作者   test 覆盖 64.1%   embedding  2.5M
+                               #   >=10   86,968 作者   test 覆盖 55.7%   embedding  1.4M
+                               # 取 5 的理由：训练期曝光不足 5 次的作者学不出可用向量
+                               # （其中 32 万个只曝光过 1 次，embedding 基本停留在初始化）。
+                               # 丢掉它们不是静默的 —— author_known 标志会告诉模型这一格是未知。
+  tag_min_count: 1             # tag 全数据集只有 58 个、train 段 58 个全部出现，无需门槛
+  video_min_count: 5           # 目标视频 ID 通道的词表门槛（train 段曝光次数）。
+                               #
+                               # 为什么排序必须有自己的 video 词表：召回词表 =
+                               # 「候选库 ∪ train 段正向视频」，**成员身份部分由训练标签决定**。
+                               # 实测 train 段 96.2 万条 OOV 样本里 is_click 与 long_view
+                               # 正样本率**恰好为 0** —— 任何正样本都会把该视频送进词表。
+                               # 于是「在词表内」这一个比特在 train 上单独就有 AUC 0.6981，
+                               # 而 valid 0.5370 / test 0.5190。模型会学这条捷径然后在
+                               # test 上失效。is_like 不受影响（AUC 0.5043），因为召回词表的
+                               # positive_signal 只含 is_click 与 long_view —— 机制完全对得上。
+                               #
+                               # 修法：目标通道改用**只由 train 曝光**（完全不看标签）构建的
+                               # 词表。门槛取 5 的实测依据：
+                               #   >=1  1,708,902 个  OOV 行在 train 占 0%   embedding 54.7M
+                               #   >=5    194,310 个  OOV 行在 train 占 47.5%  embedding  6.2M
+                               # >=1 时 OOV 那一行**在 train 从未被用到**，而 test 有 79.8%
+                               # 的行要用它，等于八成 test 样本吃一个随机初始化的向量。
+                               # >=5 让 OOV 行被充分训练，且入表视频至少 5 次曝光、向量学得出来。
+                               # 交叉验证：train 曝光 >=5 的集合与候选库**逐个相同**（都 194,310）。
+                               #
+                               # 残留（必须披露，不藏）：新的 video_id_known 仍带轻微热度信号，
+                               # train 0.5509 / test 0.5120，差 0.039。它是合法的
+                               # prediction-time 特征（train 期曝光相对 test 是过去数据），
+                               # 但差距不为零。对比标签泄漏那版的 0.179，性质不同。
+                               #
+                               # 历史通道**不动**：仍用召回词表。实测换成 train 曝光 >=1 的
+                               # 可编码率完全一样（0.9944/0.1573）—— samples 表里超出召回词表的
+                               # 历史项早已被压成 OOV，原始 id 丢了，换词表救不回来；而换成 >=5
+                               # 会把历史砍掉一半（0.5605/0.0941）。历史自身不构成捷径：
+                               # hist_len 单特征 AUC train 0.4983 / test 0.5942，方向相反。
+
+# ---- User x Author 偏好特征（plan §8.4）----
+# 为什么需要：Single-Task 在 valid 上 is_follow 的 GAUC = 0.49014、is_comment = 0.50537 ——
+# 同一用户内部排序与随机无异。模型完全没有 user x author 交互特征：用户侧只有历史视频的
+# 池化均值，物品侧只有作者 embedding，靠 MLP 反推"是否同一作者"极难。
+# 实测单特征 ua_imp_7d 的 GAUC：is_follow 0.53784 / is_comment 0.53764 —— 一个计数特征
+# 打赢整个 3,750 万参数的模型，说明信号存在、只是没进 x。
+pair_preference:
+  windows: [3, 7]              # 不取 1 天。(user,author,date) 日表 8,371,862 行而原始日志
+                               # 9,015,279 行 —— 平均每个三元组只出现 1.08 次，1 天窗口对
+                               # 约 96% 的样本恒为 0，是一列死特征。
+  labels: [is_click, long_view, is_like]
+                               # 不含 is_comment / is_follow 的计数：pair 维度曝光量 0~4，
+                               # 这两个标签的计数在 >99.9% 的行上恒为 0。
+  rate_labels: [is_click, long_view]
+                               # 只给密集信号算平滑比率。给 0.11% 的事件在 0~4 次曝光上
+                               # 算比率是纯噪声。

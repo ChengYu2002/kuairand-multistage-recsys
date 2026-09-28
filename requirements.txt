@@ -14,8 +14,8 @@ pyyaml>=6.0
 tqdm>=4.66
 matplotlib>=3.8
 
-# --- Week 2: 模型 (用到时再装) ---
-# torch>=2.4
+# --- Week 2: 模型 ---
+torch>=2.4             # 实装 2.14.0 / arm64；MPS 可用，但默认仍用 CPU（见 configs）
 
 # --- P1: 粗排与 ANN ---
 # lightgbm>=4.3
