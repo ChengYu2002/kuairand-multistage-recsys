@@ -32,9 +32,14 @@ for SEED in $SEEDS; do
   python -m src.ranking.single_task --config configs/single_task.yaml --seed "$SEED"
 done
 
+# ---- MMoE（plan §23）。输入指纹与 Single-Task 逐字相同，ΔAUC 才可归因 ----
+python scripts/verify_mmoe.py
+for SEED in $SEEDS; do
+  python -m src.ranking.mmoe --config configs/mmoe.yaml --seed "$SEED"
+done
+
 # ---- 以下均未实现（Week 3-5）。解开注释前它们会以退出码 1 中止本脚本 ----
 # for SEED in $SEEDS; do
-#   python -m src.ranking.mmoe              --config configs/mmoe.yaml       --seed "$SEED"
 #   python -m src.ranking.ple               --config configs/ple.yaml        --seed "$SEED"
 #   python -m src.ranking.selective_sharing --config configs/selective.yaml  --seed "$SEED"
 # done
