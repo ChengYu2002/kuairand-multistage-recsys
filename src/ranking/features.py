@@ -267,3 +267,33 @@ def count_params(m: nn.Module) -> dict:
               for p in mod.parameters())
     total = sum(p.numel() for p in m.parameters())
     return {"embedding": emb, "dense": total - emb, "total": total}
+
+
+# 参数分段的归类前缀。§25.1 要求 MMoE / PLE / Selective 之间参数预算可比，而它们的结构
+# 完全不同（共享专家 / 分层专家 / shared+task_specific 维度），只报一个 dense 总数没法比。
+_PARAM_GROUPS = (("expert", ("experts.", "shared_experts.", "task_experts.")),
+                 ("gate", ("gates.",)),
+                 ("tower", ("towers.", "tower.")))
+
+
+def count_params_grouped(m: nn.Module) -> dict:
+    """embedding / expert / gate / tower / other 五段计数。
+
+    归类按参数名前缀。未命中任何前缀的落进 other（Single-Task 的整个塔叫 tower，
+    所以它会落在 tower 段；编码器里的非 embedding 参数落 other）。
+    """
+    emb_ids = {id(p) for mod in m.modules() if isinstance(mod, nn.Embedding)
+               for p in mod.parameters()}
+    out = dict.fromkeys(("embedding", "expert", "gate", "tower", "other"), 0)
+    for name, p in m.named_parameters():
+        if id(p) in emb_ids:
+            out["embedding"] += p.numel()
+            continue
+        for group, prefixes in _PARAM_GROUPS:
+            if any(k in name for k in prefixes):
+                out[group] += p.numel()
+                break
+        else:
+            out["other"] += p.numel()
+    out["total"] = sum(p.numel() for p in m.parameters())
+    return out

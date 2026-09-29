@@ -74,6 +74,50 @@ log = get_logger(__name__)
 EVAL_BATCH = 8192
 
 
+def resolve_tasks(short_names: list[str], label_cols: list[str]) -> list[str]:
+    """简称 -> 真实列名。歧义或缺失一律报错，不猜。
+
+    config 里写的是 [click, long_view, like, follow, comment]，实际列名是
+    [is_click, long_view, is_like, is_comment, is_follow]。猜错列名会训练出一个预测
+    别的任务的模型，而它照样收敛、照样出 AUC。四个模型共用这一个映射。
+    """
+    out = []
+    for s in short_names:
+        cands = [c for c in label_cols if c == s or c == f"is_{s}"]
+        if len(cands) != 1:
+            raise ValueError(
+                f"任务简称 {s!r} 在标签列 {label_cols} 里匹配到 {cands}，"
+                "必须恰好一个。猜错列名会训练出一个预测别的任务的模型，而它照样收敛。"
+            )
+        out.append(cands[0])
+    return out
+
+
+class Head:
+    """烟测用：把一个 RankingData 截成前 n 行。正式跑不会用到。"""
+
+    def __init__(self, data, n: int | None) -> None:
+        self._d = data
+        self._n = len(data) if n is None else min(n, len(data))
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getattr__(self, k):
+        return getattr(self._d, k)
+
+    @property
+    def labels(self):
+        return {k: v[: self._n] for k, v in self._d.labels.items()}
+
+    @property
+    def user_id(self):
+        return self._d.user_id[: self._n]
+
+    def batch(self, rows):
+        return self._d.batch(rows)
+
+
 def epoch_order(n: int, seed: int, epoch: int) -> np.ndarray:
     """第 epoch 轮的行序。只依赖 (seed, epoch, n)，与模型和任务无关。"""
     return np.random.default_rng([seed, epoch, n]).permutation(n)
@@ -164,7 +208,9 @@ def train(model: nn.Module, tasks: tuple[str, ...], tr: RankingData, va: Ranking
                 vres = last_vres = evaluate_split(model, va, tasks)
                 history.append({
                     "epoch": ep, "step": gstep,
-                    "epoch_frac": round(gstep / steps, 4),
+                    # 全局轮位置（第 2 轮末 = 2.0），不是轮内比例。名字写清楚：
+                    # 叫 epoch_frac 时第一次读自己的曲线就会误读成 0~1。
+                    "epoch_pos": round(gstep / steps, 4),
                     "train_loss": float(np.mean(since_eval)),
                     "valid": {t: {k: vres[t][k] for k in ("auc", "gauc", "pcoc",
                                                           "gauc_users", "gauc_skipped")}

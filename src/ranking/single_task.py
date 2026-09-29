@@ -37,7 +37,11 @@ from torch import nn
 from src.ranking.dataset import RankingData, RankItemStatic
 from src.ranking.features import RankingEncoder, mlp
 from src.ranking.trainer import (
+    Head as _Head,
+)
+from src.ranking.trainer import (
     format_table,
+    resolve_tasks,
     save_checkpoint,
     train,
     write_results,
@@ -47,20 +51,6 @@ from src.utils.logger import get_logger
 from src.utils.seed import set_seed
 
 log = get_logger(__name__)
-
-
-def resolve_tasks(short_names: list[str], label_cols: list[str]) -> list[str]:
-    """简称 -> 真实列名。歧义或缺失一律报错，不猜。"""
-    out = []
-    for s in short_names:
-        cands = [c for c in label_cols if c == s or c == f"is_{s}"]
-        if len(cands) != 1:
-            raise ValueError(
-                f"任务简称 {s!r} 在标签列 {label_cols} 里匹配到 {cands}，"
-                "必须恰好一个。猜错列名会训练出一个预测别的任务的模型，而它照样收敛。"
-            )
-        out.append(cands[0])
-    return out
 
 
 class SingleTaskDNN(nn.Module):
@@ -170,31 +160,6 @@ def main() -> int:
     print(format_table(combined, "test" if a.eval_test else "valid"))
     print()
     return 0
-
-
-class _Head:
-    """烟测用：把一个 RankingData 截成前 n 行。正式跑不会用到。"""
-
-    def __init__(self, data: RankingData, n: int | None) -> None:
-        self._d = data
-        self._n = len(data) if n is None else min(n, len(data))
-
-    def __len__(self) -> int:
-        return self._n
-
-    def __getattr__(self, k):
-        return getattr(self._d, k)
-
-    @property
-    def labels(self):
-        return {k: v[: self._n] for k, v in self._d.labels.items()}
-
-    @property
-    def user_id(self):
-        return self._d.user_id[: self._n]
-
-    def batch(self, rows):
-        return self._d.batch(rows)
 
 
 if __name__ == "__main__":
