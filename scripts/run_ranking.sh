@@ -38,10 +38,19 @@ for SEED in $SEEDS; do
   python -m src.ranking.mmoe --config configs/mmoe.yaml --seed "$SEED"
 done
 
-# ---- 以下均未实现（Week 3-5）。解开注释前它们会以退出码 1 中止本脚本 ----
+# ---- CGC / PLE（plan §24）。一个文件两个模型：--levels 1 = CGC，2 = PLE ----
+# 专家宽度已压到 [128,96] 使 dense 参数与 MMoE 可比（§25.1）：CGC 0.81x / PLE 1.17x
+python scripts/verify_ple.py
+for SEED in $SEEDS; do
+  python -m src.ranking.ple --config configs/ple.yaml --seed "$SEED" --levels 1
+  python -m src.ranking.ple --config configs/ple.yaml --seed "$SEED"
+done
+
+# ---- 汇总：逐任务 mean ± std 与配对 ΔAUC / ΔGAUC ----
+python -m src.evaluation.multitask_analysis
+
+# ---- 以下未实现（Week 3-5）。解开注释前它会以退出码 1 中止本脚本 ----
 # for SEED in $SEEDS; do
-#   python -m src.ranking.ple               --config configs/ple.yaml        --seed "$SEED"
 #   python -m src.ranking.selective_sharing --config configs/selective.yaml  --seed "$SEED"
 # done
-# python -m src.evaluation.multitask_analysis
 # python -m src.analysis.multitask_transfer

@@ -359,7 +359,7 @@ def main() -> int:
         prot = {n: tuple(r.get(k) for k in ("epochs", "batch_size", "lr",
                                             "checkpoint_rule")) for n, r in seen}
         check(len(set(prot.values())) == 1,
-              f"{len(seen)} 份结果的训练协议一致：{sorted(set(prot.values()))[0]}"
+              f"{len(seen)} 份结果的训练协议一致：{min(prot.values())}"
               + ("" if len(set(prot.values())) == 1 else f" -> 逐份 {prot}"))
         check(all(r.get("checkpoint_rule") == "fixed_epochs_last" for _, r in seen),
               "每份结果都记录了 fixed_epochs_last（没有谁偷偷挑了最佳轮）")

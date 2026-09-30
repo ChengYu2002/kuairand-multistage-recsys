@@ -190,19 +190,26 @@ def train(model: nn.Module, tasks: tuple[str, ...], tr: RankingData, va: Ranking
                 raise AssertionError(
                     f"第 {i} 批为空（bs={bs}, len(order)={len(order)}）—— "
                     "行序与步数的口径不一致，空 batch 会静默污染 train_loss")
+            # RankingData读取
             b = tr.batch(rows)
+            # 还没有sigmoid
             logits = model(b)
             loss = torch.stack(
                 [F.binary_cross_entropy_with_logits(logits[t], b[f"label_{t}"]) for t in tasks]
             ).mean()
+
+            # 清空上一批的梯度
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            # 根据梯度更新参数
             opt.step()
             losses.append(loss.detach().item())
             since_eval.append(losses[-1])
+            # 全局训练步数加一
             gstep += 1
             # 轮内按步记曲线（只记录，不据此挑 checkpoint）。最后一步一定评，
             # 所以 epochs=1 也不会只剩一个点。
+            # 判断是不是当前epoch最后一个batch
             last_of_epoch = i + 1 == steps
             if last_of_epoch or (eval_every > 0 and gstep % eval_every == 0):
                 vres = last_vres = evaluate_split(model, va, tasks)

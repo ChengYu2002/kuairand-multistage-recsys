@@ -84,40 +84,63 @@ class MMoE(nn.Module):
         super().__init__()
         self.tasks = list(tasks)
         self.encoder = RankingEncoder(data, cfg)
+        # RankingEncoder 最终输出的特征维度
         d_in = self.encoder.out_dim
+        # 专家数量
         self.n_experts = int(cfg["n_experts"])
         if self.n_experts < 2:
             raise ValueError(
                 f"n_experts 必须 >= 2，收到 {self.n_experts}。只有 1 个专家时门控恒为 1，"
                 "MMoE 退化成一个共享底座 + 每任务小塔，那是 Shared-Bottom 而不是 MMoE。"
             )
+        # “专家网络每层有多少个神经元”
         eh = list(cfg["expert_hidden"])
         drop = float(cfg.get("dropout", 0.0))
         # 专家：五个任务共用这一组
         self.experts = nn.ModuleList(
-            [mlp(d_in, eh, dropout=drop) for _ in range(self.n_experts)])
+            [mlp(d_in, eh, dropout=drop) for _ in range(self.n_experts)]
+        )
         # 门控：每个任务一套，softmax over 专家
         self.gates = nn.ModuleList(
-            [nn.Linear(d_in, self.n_experts) for _ in self.tasks])
+            [nn.Linear(d_in, self.n_experts) for _ in self.tasks]
+        )
         # 塔：每个任务一套
         self.towers = nn.ModuleList(
-            [mlp(eh[-1], list(cfg["tower_hidden"]), out_dim=1, dropout=drop)
-             for _ in self.tasks])
+            # 每个tower128 → 64 → 1
+            [
+                mlp(eh[-1], list(cfg["tower_hidden"]), out_dim=1, dropout=drop)
+                for _ in self.tasks
+            ]
+        )
 
     def gate_weights(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """每个任务对各专家的权重，(B, K)，非负且按行和为 1。验算与门控分析都用它。"""
-        return {t: torch.softmax(self.gates[i](x), dim=-1)
-                for i, t in enumerate(self.tasks)}
+        return {
+            t: torch.softmax(self.gates[i](x), dim=-1) for i, t in enumerate(self.tasks)
+        }
 
+    # MMoE最核心的完整前向传播
     def forward(self, b: dict) -> dict[str, torch.Tensor]:
+        # 把batch编码成统一特征
         x = self.encoder(b)
         # (B, K, d_expert)：专家只前向一次，被所有任务共用 —— 这就是「共享」的实处
         e = torch.stack([E(x) for E in self.experts], dim=1)
+        # 等价于 expert_outputs = []， 每个专家都是 323 → 256 → 128
+        # for E in self.experts:
+        #     expert_output = E(x)
+        #     expert_outputs.append(expert_output)
+        #  stack再把每个专家拼接
         out = {}
         for i, t in enumerate(self.tasks):
-            g = torch.softmax(self.gates[i](x), dim=-1)          # (B, K)
-            h = torch.einsum("bk,bkd->bd", g, e)                 # h_t = Σ_k g_tk · E_k
-            out[t] = self.towers[i](h).squeeze(-1)
+            g = torch.softmax(self.gates[i](x), dim=-1)  # (B, K)
+            h = torch.einsum("bk,bkd->bd", g, e)  # h_t = Σ_k g_tk · E_k
+            # 以一条样本为例：
+            # h =
+            # 0.10 × 专家1的128维输出
+            # + 0.20 × 专家2的128维输出
+            # + ...
+            # + 0.08 × 专家8的128维输出
+            out[t] = self.towers[i](h).squeeze(-1)  # 删除最后那个大小为1的维度
         return out
 
 
@@ -127,19 +150,30 @@ def main() -> int:
     ap.add_argument("--protocol", default="main", choices=("main", "aux"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tasks", default=None, help="逗号分隔的简称子集，覆盖 config")
-    ap.add_argument("--eval-test", action="store_true",
-                    help="在 test 上评估。默认不评 —— 开发期反复看 test 会把它变成第二个 "
-                         "validation，而 test 只能用一次。架构与超参冻结后再统一开。")
+    ap.add_argument(
+        "--eval-test",
+        action="store_true",
+        help="在 test 上评估。默认不评 —— 开发期反复看 test 会把它变成第二个 "
+        "validation，而 test 只能用一次。架构与超参冻结后再统一开。",
+    )
     # 下面三个是烟测/诊断专用。带上任意一个都会改 tag，避免覆盖正式结果。
     ap.add_argument("--epochs", type=int, default=None, help="覆盖轮数（诊断曲线用）")
-    ap.add_argument("--limit-train", type=int, default=None, help="烟测：只用前 N 行训练")
-    ap.add_argument("--limit-eval", type=int, default=None, help="烟测：valid/test 只取前 N 行")
+    ap.add_argument(
+        "--limit-train", type=int, default=None, help="烟测：只用前 N 行训练"
+    )
+    ap.add_argument(
+        "--limit-eval", type=int, default=None, help="烟测：valid/test 只取前 N 行"
+    )
     a = ap.parse_args()
 
     cfg = load_config(a.config)
     proc = project_path(require(cfg, "data", "dataset", "processed_dir"))
     label_cols = require(cfg, "data", "labels", "tasks")
-    shorts = [s.strip() for s in a.tasks.split(",")] if a.tasks else list(require(cfg, "tasks"))
+    shorts = (
+        [s.strip() for s in a.tasks.split(",")]
+        if a.tasks
+        else list(require(cfg, "tasks"))
+    )
     tasks = resolve_tasks(shorts, label_cols)
     if a.epochs:
         cfg["epochs"] = a.epochs
@@ -151,11 +185,17 @@ def main() -> int:
     set_seed(a.seed)
     ic = require(cfg, "input")
     st = RankItemStatic(proc, a.protocol)
-    dl = {"max_hist": int(ic["max_hist"]), "mask_oov": bool(ic["mask_oov_in_history"]),
-          "pair_features": bool(ic["pair_features"])}
+    dl = {
+        "max_hist": int(ic["max_hist"]),
+        "mask_oov": bool(ic["mask_oov_in_history"]),
+        "pair_features": bool(ic["pair_features"]),
+    }
     tr = RankingData(proc, a.protocol, "train", st, **dl)
     va = RankingData(proc, a.protocol, "valid", st, **dl)
     te = RankingData(proc, a.protocol, "test", st, **dl) if a.eval_test else None
+    #     tr：训练数据
+    #     va：验证数据
+    #     te：测试数据
     if a.limit_train or a.limit_eval:
         tr = Head(tr, a.limit_train)
         va = Head(va, a.limit_eval)
@@ -164,20 +204,34 @@ def main() -> int:
     # 一个模型带五个头 —— 没有 Single-Task 那个五次循环
     model = MMoE(tr, cfg, tasks)
     fp = model.encoder.fingerprint()
-    res = train(model, tuple(tasks), tr, va, te, cfg, a.seed, tag, fp,
-                eval_test=a.eval_test)
-    res.update({
-        "model": "mmoe", "protocol": a.protocol, "smoke": smoke,
-        "n_experts": model.n_experts,
-        "expert_hidden": list(cfg["expert_hidden"]),
-        "tower_hidden": list(cfg["tower_hidden"]),
-        # §25.1 的 parameter budget 要分段报
-        "params_grouped": count_params_grouped(model),
-    })
-    save_checkpoint(model, {"model": "mmoe", "tasks": tasks, "seed": a.seed,
-                            "protocol": a.protocol,
-                            "checkpoint_rule": res["checkpoint_rule"],
-                            "input_fingerprint": fp}, tag)
+    # 调用公共训练器
+    res = train(
+        model, tuple(tasks), tr, va, te, cfg, a.seed, tag, fp, eval_test=a.eval_test
+    )
+    res.update(
+        {
+            "model": "mmoe",
+            "protocol": a.protocol,
+            "smoke": smoke,
+            "n_experts": model.n_experts,
+            "expert_hidden": list(cfg["expert_hidden"]),
+            "tower_hidden": list(cfg["tower_hidden"]),
+            # §25.1 的 parameter budget 要分段报
+            "params_grouped": count_params_grouped(model),
+        }
+    )
+    save_checkpoint(
+        model,
+        {
+            "model": "mmoe",
+            "tasks": tasks,
+            "seed": a.seed,
+            "protocol": a.protocol,
+            "checkpoint_rule": res["checkpoint_rule"],
+            "input_fingerprint": fp,
+        },
+        tag,
+    )
     write_results(res, tag)
     print()
     print(format_table(res, "test" if a.eval_test else "valid"))
