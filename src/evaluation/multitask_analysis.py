@@ -63,7 +63,7 @@ from src.utils.logger import get_logger
 log = get_logger(__name__)
 
 BASELINE = "single_task"
-MODEL_ORDER = ("single_task", "mmoe", "ple", "selective_sharing")
+MODEL_ORDER = ("single_task", "mmoe", "cgc", "ple", "selective_sharing")
 METRICS = ("auc", "gauc", "pcoc")
 # 汇总前必须一致的字段。不一致 = 两张表混了口径，而混出来的表看不出异常。
 PROTOCOL_KEYS = ("epochs", "batch_size", "lr", "weight_decay", "dropout",
@@ -146,7 +146,6 @@ def main() -> int:
                     {m: len(v) for m, v in seeds.items()})
 
     vals = collect(runs, a.split, tasks)
-    base = vals[BASELINE]
 
     # 配对差值：只在 seed 集合完全相同时才算，否则相减的是不同 seed 的结果
     paired: dict = defaultdict(lambda: defaultdict(dict))
@@ -160,6 +159,11 @@ def main() -> int:
                 paired[m][t][k] = None if not ok else np.array(
                     [runs[m][sd][a.split][t][k] - runs[BASELINE][sd][a.split][t][k]
                      for sd in base_seeds], float)
+                # m   = 模型，例如 cgc、ple、mmoe
+                # t   = 任务，例如 is_click
+                # k   = 指标，例如 auc、gauc
+                # sd  = seed，例如 42、43、44
+                # BASELINE = single_task
 
     for k in ("auc", "gauc"):
         # 表头不写统一的 seed 数：各模型可能不同（跑挂过、补跑中），写一个数会让人读错。
