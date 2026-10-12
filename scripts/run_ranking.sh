@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # 排序侧（Track B）。顺序即依赖顺序 —— 下游会静默读到上一次的旧文件。
 #
-# 当前只跑 Single-Task。MMoE / PLE / Selective Sharing 与后续分析还是 stub，
-# 已改成显式抛错（退出码 1），所以配合 set -e 不会出现「脚本全绿但什么都没跑」。
-# Week 3 实现后把下面 MTL 段的注释解开。
+# 当前跑完整的 Single-Task / MMoE / CGC / PLE / Selective Sharing 主线。
+# 每个模型先验算再训练；set -e 保证任何结构检查失败都会中止，不会带病出表。
 set -euo pipefail
 CFG=${CFG:-configs/data.yaml}
 SEEDS=${SEEDS:-42}          # 开发期单 seed；正式实验 SEEDS="42 43 44"（plan §26）
@@ -46,11 +45,14 @@ for SEED in $SEEDS; do
   python -m src.ranking.ple --config configs/ple.yaml --seed "$SEED"
 done
 
+# ---- Selective Sharing（plan §25）：共享表示逐维门控 + 每任务私有表示 ----
+python scripts/verify_selective_sharing.py
+for SEED in $SEEDS; do
+  python -m src.ranking.selective_sharing --config configs/selective.yaml --seed "$SEED"
+done
+
 # ---- 汇总：逐任务 mean ± std 与配对 ΔAUC / ΔGAUC ----
 python -m src.evaluation.multitask_analysis
 
-# ---- 以下未实现（Week 3-5）。解开注释前它会以退出码 1 中止本脚本 ----
-# for SEED in $SEEDS; do
-#   python -m src.ranking.selective_sharing --config configs/selective.yaml  --seed "$SEED"
-# done
+# ---- 以下未实现（Week 4-5）----
 # python -m src.analysis.multitask_transfer
