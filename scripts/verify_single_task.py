@@ -339,7 +339,7 @@ def main() -> int:
     # config 一致（I 段）保证的是"打算用同一套"，这里查的是"实际跑出来的确实是同一套"：
     # 中途改过 config 再跑、或用旧 checkpoint 补表，都会在这里现形。
     import json as _json
-    MODELS = {"single_task", "mmoe", "ple", "selective_sharing"}
+    MODELS = {"single_task", "mmoe", "cgc", "ple", "selective_sharing"}
     seen = []
     for f in sorted((ROOT / "results").glob("*.json")):
         try:

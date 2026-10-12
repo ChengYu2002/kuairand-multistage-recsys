@@ -57,12 +57,16 @@ eval_every_steps: 500        # 每 500 步在 valid 上记一次曲线（**只�
                              # 发现峰值在第 0.11 轮。epochs=1 时按轮记只有一个点，等于没有曲线。
 seeds: [42, 43, 44]        # 最终实验必须 3 seeds，报告 mean ± std
 
-sharing_mode: selective        # full_shared | selective | ple_style
-shared_dim: 96
-task_specific_dim: 32
-expert_hidden: [256, 128]
+# plan §25 的三方比较跨文件完成：MMoE = fully-shared expert pool，CGC/PLE =
+# task-specific expert capacity，本文件只实现 selective task-specific representation。
+sharing_mode: selective        # 逐任务 sigmoid 门控共享表示，不是 softmax 专家选择
+shared_dim: 96                 # 所有任务共用的表示；每个任务可逐维保留或屏蔽
+task_specific_dim: 32          # 与 shared 并行读取 x，不是先 shared 再 private；只收本任务梯度
+expert_hidden: [256, 128]      # shared / private 分支使用相同骨架，最后投影到 96 / 32
 tower_hidden: [64]
-match_parameter_budget: true   # 与 MMoE / PLE 尽量保持参数可比
+match_parameter_budget: true   # 构造时强制 dense 参数落在 MMoE 的 ±20%，不是说明性注释
+budget_reference_config: configs/mmoe.yaml  # 直接读正式 MMoE 配置，不手抄一份会漂移的结构
+budget_tolerance: 0.20
 
 # 输入编码器口径。四个模型**必须逐字相同** —— §27.1 的 ΔAUC 要求除共享机制外无差异，
 # 输入拼法各写一套就会把差异算进 ΔAUC。trainer 会把这份口径的指纹写进 results，
