@@ -21,8 +21,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "data" / "processed" / "retrieval_freeze_manifest.json"
-# 清单自身与纯缓存不纳入
-SKIP_NAMES = {MANIFEST.name, ".DS_Store", ".gitkeep"}
+# 清单自身与纯缓存不纳入。`two_tower__determinism_probe.pt` 是
+# verify_two_tower.py 每次验算都会覆盖的临时 checkpoint，不是实验产物；把它纳入
+# 冻结清单会导致「刚跑完验算，冻结检查必失败」的自相矛盾。
+SKIP_NAMES = {
+    MANIFEST.name,
+    ".DS_Store",
+    ".gitkeep",
+    "two_tower__determinism_probe.pt",
+}
 WATCH = ["data/processed", "experiments", "results"]
 
 
@@ -43,7 +50,10 @@ def scan() -> dict[str, dict]:
         for p in sorted(base.rglob("*")):
             if not p.is_file() or p.name in SKIP_NAMES or "__pycache__" in p.parts:
                 continue
-            out[str(p.relative_to(ROOT))] = {"sha256": sha256(p), "bytes": p.stat().st_size}
+            out[str(p.relative_to(ROOT))] = {
+                "sha256": sha256(p),
+                "bytes": p.stat().st_size,
+            }
     return out
 
 
@@ -58,22 +68,33 @@ def main() -> int:
 
     if a.record:
         if MANIFEST.exists() and not a.force:
-            print(f"基线已存在：{MANIFEST.relative_to(ROOT)}。"
-                  "重新记录会把「当前状态」当成基线，从而掩盖已发生的改动；"
-                  "确认要这么做请加 --force。")
+            print(
+                f"基线已存在：{MANIFEST.relative_to(ROOT)}。"
+                "重新记录会把「当前状态」当成基线，从而掩盖已发生的改动；"
+                "确认要这么做请加 --force。"
+            )
             return 1
         files = scan()
-        MANIFEST.write_text(json.dumps(
-            {"n_files": len(files), "files": files}, indent=2, sort_keys=True), encoding="utf-8")
+        MANIFEST.write_text(
+            json.dumps(
+                {"n_files": len(files), "files": files}, indent=2, sort_keys=True
+            ),
+            encoding="utf-8",
+        )
         total = sum(v["bytes"] for v in files.values())
-        print(f"已记录 {len(files)} 个文件（{total / 2**30:.2f} GB）-> "
-              f"{MANIFEST.relative_to(ROOT)}")
+        print(
+            f"已记录 {len(files)} 个文件（{total / 2**30:.2f} GB）-> "
+            f"{MANIFEST.relative_to(ROOT)}"
+        )
         return 0
 
     if not MANIFEST.exists():
         print(f"找不到基线 {MANIFEST.relative_to(ROOT)}，先跑 --record")
         return 1
     base = json.loads(MANIFEST.read_text("utf-8"))["files"]
+    # 旧清单可能在该文件被明确标记为缓存之前已经记录过它；检查时也要从基线侧过滤，
+    # 否则新扫描不再包含它，却会被误报成「旧产物被删除」。
+    base = {k: v for k, v in base.items() if Path(k).name not in SKIP_NAMES}
     now = scan()
     changed = [k for k in base if k in now and now[k]["sha256"] != base[k]["sha256"]]
     missing = [k for k in base if k not in now]
@@ -85,8 +106,10 @@ def main() -> int:
     for k in added:
         print(f"  新增      {k}")
     ok = not changed and not missing
-    print(f"\n基线 {len(base)} 个文件：修改 {len(changed)}，删除 {len(missing)}，"
-          f"新增 {len(added)}。{'召回侧产物未变。' if ok else '有旧产物被改动！'}")
+    print(
+        f"\n基线 {len(base)} 个文件：修改 {len(changed)}，删除 {len(missing)}，"
+        f"新增 {len(added)}。{'召回侧产物未变。' if ok else '有旧产物被改动！'}"
+    )
     return 0 if ok else 1
 
 

@@ -72,8 +72,8 @@ def _fit(model, data, rows, labels, task, steps, lr=1e-3, seed=0,
         loss.backward()
         opt.step()
         if i == 0:
-            first = float(loss)
-        last = float(loss)
+            first = float(loss.detach())
+        last = float(loss.detach())
     with torch.no_grad():
         p = torch.sigmoid(model(data.batch(rows))[task]).numpy()
         a_tr = auc(p, labels[rows].astype(np.int64))

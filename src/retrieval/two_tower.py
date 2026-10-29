@@ -53,9 +53,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from src.retrieval.dataset import RetrievalData
-from src.retrieval.inbatch_negative import InBatchNegative
 from src.retrieval.item_tower import ItemTower
-from src.retrieval.random_negative import RandomNegative
+from src.retrieval.negative_sampling import SAMPLERS, build_sampler
 from src.retrieval.user_tower import UserTower
 from src.utils.config import load_config, project_path, require
 from src.utils.logger import get_logger
@@ -63,7 +62,7 @@ from src.utils.seed import set_seed
 
 log = get_logger(__name__)
 
-SAMPLERS = {"random": RandomNegative, "inbatch": InBatchNegative}
+# SAMPLERS / build_sampler 见 src/retrieval/negative_sampling.py
 
 
 class TwoTower(nn.Module):
@@ -83,21 +82,23 @@ class TwoTower(nn.Module):
 
         # ItemTower
         # video_idx
-           # ↓
+        # ↓
         # 共享 item embedding
-           # ↓
+        # ↓
         # MLP：256 → 128 → 64
-           # ↓
+        # ↓
         # 物品向量 v
         self.item_tower = ItemTower(
-            self.item_emb, tt["item_tower_config"],
+            self.item_emb,
+            tt["item_tower_config"],
             n_authors=int(data.item_author.max()) + 2,
             n_tags=int(data.item_tags.max()) + 2,
             hidden=tt["item_tower_hidden"],
         )
         # UserTower
         self.user_tower = UserTower(
-            self.item_emb, n_t1=data.user_t1.shape[1],
+            self.item_emb,
+            n_t1=data.user_t1.shape[1],
             n_static_num=data.user_static_num.shape[1],
             static_cat_sizes=data.user_static_cat_sizes,
             hidden=tt["user_tower_hidden"],
@@ -114,14 +115,20 @@ class TwoTower(nn.Module):
     def item_vec(self, b: dict) -> torch.Tensor:
         return F.normalize(self.item_tower(b), dim=-1)
 
-    def loss(self, u: torch.Tensor, v_pos: torch.Tensor, v_neg: torch.Tensor,
-             pos_ids: torch.Tensor, neg_ids: torch.Tensor) -> torch.Tensor:
+    def loss(
+        self,
+        u: torch.Tensor,
+        v_pos: torch.Tensor,
+        v_neg: torch.Tensor,
+        pos_ids: torch.Tensor,
+        neg_ids: torch.Tensor,
+    ) -> torch.Tensor:
         """让每个用户在「1 个正视频 + n 个负视频」中选出正视频。"""
 
         # 用户分别和正视频、负视频做点积；向量已经 L2 归一化，所以点积就是余弦相似度。
         # 除以 temperature 只放大分数差距，不改变视频之间的排序。
-        s_pos = (u * v_pos).sum(-1, keepdim=True) / self.temperature      # (B, 1)
-        s_neg = torch.einsum("bd,bnd->bn", u, v_neg) / self.temperature   # (B, n_neg)
+        s_pos = (u * v_pos).sum(-1, keepdim=True) / self.temperature  # (B, 1)
+        s_neg = torch.einsum("bd,bnd->bn", u, v_neg) / self.temperature  # (B, n_neg)
 
         # 如果负采样误抽到正视频本身，就把该位置设为 -inf，让它不参与 softmax。(e^{-inf}=0)
         s_neg = s_neg.masked_fill(neg_ids == pos_ids.unsqueeze(1), float("-inf"))
@@ -148,8 +155,14 @@ def train_rows(data: RetrievalData, lo: int, hi: int, scope: str) -> np.ndarray:
 
 
 @torch.no_grad()
-def item_matrix(model: TwoTower, data: RetrievalData, lo: int, hi: int,
-                date: int | None, block: int = 8192) -> np.ndarray:
+def item_matrix(
+    model: TwoTower,
+    data: RetrievalData,
+    lo: int,
+    hi: int,
+    date: int | None,
+    block: int = 8192,
+) -> np.ndarray:
     """候选库全部 item 的向量。date 为 None 表示与日期无关（id_only）。"""
     idx = np.arange(lo, hi + 1, dtype=np.int64)
     out = None
@@ -161,6 +174,7 @@ def item_matrix(model: TwoTower, data: RetrievalData, lo: int, hi: int,
             out = np.empty((len(idx), v.shape[1]), np.float32)
         out[s : s + block] = v
     return out
+
 
 # 训练好的双塔模型
 #         ↓
@@ -180,12 +194,17 @@ def item_matrix(model: TwoTower, data: RetrievalData, lo: int, hi: int,
 #         ↓
 # 计算 Recall@K 和 NDCG@K
 
+
 @torch.no_grad()
-def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
-    """加载好的模型 -> 每个查询时刻的 Top-K -> 统一的 evaluate()。返回 polars.DataFrame。"""
+def request_topk(model: TwoTower, cfg: dict, proc, protocol: str, data=None):
+    """逐 request 的 Top-K（已映射回 video_id），外加考题表。
+
+    从 evaluate_checkpoint 里**抽出**而非复制：§7.2 的频次分层分析要的是逐 request
+    的 Top-K 而不是聚合指标，而两处各算一份的话，一处改了另一处不会跟着改 ——
+    两张表仍然都能出，只是其中一张是错的。
+    """
     import polars as pl
 
-    from src.evaluation.retrieval_metrics import evaluate
     from src.retrieval.ann_index import topk_scores
 
     tt = require(cfg, "two_tower")
@@ -198,10 +217,15 @@ def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
     catalog = pl.read_parquet(proc / f"catalog_{protocol}.parquet")
     reqs = pl.read_parquet(proc / f"eval_requests_{protocol}.parquet")
 
-    data = RetrievalData(proc, protocol, "test")
+    # data 可由调用方传入：分层分析要对 12 个 checkpoint 逐个算 Top-K，每次重新
+    # 装载 test 段要 60 秒 x 12 = 12 分钟，而这份数据是只读的、可以共用。
+    # 默认 None 时行为与改动前完全一致。
+    if data is None:
+        data = RetrievalData(proc, protocol, "test")
     # 找到每道考题对应的样本行
     samples = pl.read_parquet(
-        proc / f"samples_test_{protocol}.parquet", columns=["user_id", "video_id", "time_ms"]
+        proc / f"samples_test_{protocol}.parquet",
+        columns=["user_id", "video_id", "time_ms"],
     ).with_row_index("srow")
     # 显式保序：polars 的 left join 不保证输出顺序与左表一致
     linked = (
@@ -223,9 +247,14 @@ def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
     mid = (
         linked.select("user_id", "time_ms")
         .with_row_index("_j")
-        .join(mom.select("user_id", "time_ms", "mrow"), on=["user_id", "time_ms"], how="left")
+        .join(
+            mom.select("user_id", "time_ms", "mrow"),
+            on=["user_id", "time_ms"],
+            how="left",
+        )
         .sort("_j")
-        .get_column("mrow").to_numpy()
+        .get_column("mrow")
+        .to_numpy()
     )
     log.info("考题 %s 条 -> 唯一查询时刻 %s 个", f"{len(reqs):,}", f"{len(mom):,}")
 
@@ -241,21 +270,41 @@ def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
     dates = np.unique(mom["date"].to_numpy()) if per_day else [None]
     topk = np.empty((len(mom), k), np.int32)
     for d in dates:
-        sel = np.arange(len(mom)) if d is None else np.flatnonzero(mom["date"].to_numpy() == d)
+        sel = (
+            np.arange(len(mom))
+            if d is None
+            else np.flatnonzero(mom["date"].to_numpy() == d)
+        )
         iv = item_matrix(model, data, lo, hi, d)
         # 3. 用户向量与全候选库计算点积分数，为每个请求保留 Top-K。
         idx, _ = topk_scores(uv[sel], iv, k=k)
         topk[sel] = idx
         del iv
-    log.info("物品向量算了 %d 份（%s）", len(dates),
-             "按评估日，因为 id_side 的 video_age 随日期变" if per_day else "与日期无关")
+    log.info(
+        "物品向量算了 %d 份（%s）",
+        len(dates),
+        "按评估日，因为 id_side 的 video_age 随日期变" if per_day else "与日期无关",
+    )
 
     # 映射回原始 video_id
     # 4. Top-K 目前是候选矩阵行号，先映射回原始 video_id。
     cat_ids = catalog.get_column("video_id").to_numpy()
+    return cat_ids[topk][mid], reqs
+
+
+@torch.no_grad()
+def evaluate_checkpoint(model: TwoTower, cfg: dict, proc, protocol: str):
+    """加载好的模型 -> 每个查询时刻的 Top-K -> 统一的 evaluate()。返回 polars.DataFrame。"""
+    from src.evaluation.retrieval_metrics import evaluate
+
     # 5. 把预测 Top-K 和测试集真实答案交给统一 evaluate()，计算 Recall/NDCG。
-    return evaluate(cat_ids[topk][mid], reqs.get_column("video_id"),
-                    reqs.get_column("user_id").to_numpy(), k_list)
+    topk, reqs = request_topk(model, cfg, proc, protocol)
+    return evaluate(
+        topk,
+        reqs.get_column("video_id"),
+        reqs.get_column("user_id").to_numpy(),
+        require(cfg, "eval", "k_list"),
+    )
 
 
 def main() -> int:
@@ -265,7 +314,9 @@ def main() -> int:
     ap.add_argument("--negative", default=None, choices=tuple(SAMPLERS))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-steps", type=int, default=None, help="覆盖 config，用于烟测")
-    ap.add_argument("--eval-only", action="store_true", help="不训练，直接评估已有 checkpoint")
+    ap.add_argument(
+        "--eval-only", action="store_true", help="不训练，直接评估已有 checkpoint"
+    )
     ap.add_argument("--no-eval", action="store_true", help="只训练，跳过评估")
     ap.add_argument("--tag", default=None, help="覆盖产物名（默认由实验维度拼成）")
     args = ap.parse_args()
@@ -275,8 +326,7 @@ def main() -> int:
     strategy = args.negative or require(cfg, "negative_sampling", "strategy")
     if strategy not in SAMPLERS:
         raise NotImplementedError(
-            f"负采样策略 {strategy!r} 尚未实现（当前只有 {sorted(SAMPLERS)}）。"
-            "exposure / hybrid 是 Week 3 的内容。"
+            f"负采样策略 {strategy!r} 不存在（当前有 {sorted(SAMPLERS)}）"
         )
     tt = require(cfg, "two_tower")
     scope = tt["train_target_scope"]
@@ -286,7 +336,9 @@ def main() -> int:
             "拼错会静默走另一条分支：vocab 口径下正负样本不同空间，"
             "「不在候选库」将完美预测「是正样本」（占 42%）。"
         )
-    steps = args.max_steps or tt["max_steps"]
+    steps = args.max_steps if args.max_steps is not None else tt["max_steps"]
+    if steps < 1:
+        raise ValueError(f"训练步数必须 >= 1，收到 {steps}")
     bs, n_neg = tt["batch_size"], tt["negatives_per_positive"]
     meta = json.loads((proc / f"vocab_meta_{args.protocol}.json").read_text("utf-8"))
     lo, hi = meta["video_catalog_index_min"], meta["video_catalog_index_max"]
@@ -311,12 +363,19 @@ def main() -> int:
 
     data = RetrievalData(proc, args.protocol, "train")
     rows = train_rows(data, lo, hi, scope)
-    log.info("训练正样本 %s 条（目标范围 %s，候选库 index [%d, %d]）",
-             f"{len(rows):,}", scope, lo, hi)
+    log.info(
+        "训练正样本 %s 条（目标范围 %s，候选库 index [%d, %d]）",
+        f"{len(rows):,}",
+        scope,
+        lo,
+        hi,
+    )
 
     model = TwoTower(data, cfg)
     opt = torch.optim.Adam(model.parameters(), lr=tt["lr"])
-    sampler = SAMPLERS[strategy](lo, hi)
+    sampler = build_sampler(
+        strategy, lo, hi, data=data, cfg=cfg, proc=proc, protocol=args.protocol
+    )
     gen = torch.Generator().manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
@@ -350,45 +409,94 @@ def main() -> int:
         opt.step()
 
         # 6. 保存当前 loss；每完成约 10% 时打印最近 100 步均值，减少单个 batch 的波动。
-        losses.append(float(loss))
+        losses.append(float(loss.detach()))
         if step % max(1, steps // 10) == 0 or step == steps:
-            log.info("step %6d/%d  loss %.4f  (%.1fs)",
-                     step, steps, float(np.mean(losses[-100:])), time.perf_counter() - t0)
+            log.info(
+                "step %6d/%d  loss %.4f  (%.1fs)",
+                step,
+                steps,
+                float(np.mean(losses[-100:])),
+                time.perf_counter() - t0,
+            )
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "strategy": strategy,
-                "item_tower_config": tt["item_tower_config"], "protocol": args.protocol,
-                "seed": args.seed, "steps": steps,
-                "catalog_range": [lo, hi], "loss_tail": float(np.mean(losses[-100:]))}, out)
-    log.info("已保存 %s（最后 100 步均值 loss %.4f，总耗时 %.1fs）",
-             out.name, float(np.mean(losses[-100:])), time.perf_counter() - t0)
+    sampler_stats = sampler.stats() if hasattr(sampler, "stats") else None
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "strategy": strategy,
+            "item_tower_config": tt["item_tower_config"],
+            "protocol": args.protocol,
+            "seed": args.seed,
+            "steps": steps,
+            "catalog_range": [lo, hi],
+            "loss_tail": float(np.mean(losses[-100:])),
+            # exposure/hybrid 的空池子 fallback 比例必须随结果一起落盘：
+            # 比例偏高时 "exposure" 其实掺了 random，读结论时必须看得见。
+            "sampler": sampler_stats,
+        },
+        out,
+    )
+    log.info(
+        "已保存 %s（最后 100 步均值 loss %.4f，总耗时 %.1fs）",
+        out.name,
+        float(np.mean(losses[-100:])),
+        time.perf_counter() - t0,
+    )
     if not args.no_eval:
         del data
         model.eval()
-        _report(evaluate_checkpoint(model, cfg, proc, args.protocol), tag,
-                {"steps": steps, "loss_tail": float(np.mean(losses[-100:])),
-                 "strategy": strategy, "item_tower_config": tt["item_tower_config"],
-                 "protocol": args.protocol, "seed": args.seed})
+        _report(
+            evaluate_checkpoint(model, cfg, proc, args.protocol),
+            tag,
+            {
+                "steps": steps,
+                "loss_tail": float(np.mean(losses[-100:])),
+                "strategy": strategy,
+                "item_tower_config": tt["item_tower_config"],
+                "protocol": args.protocol,
+                "seed": args.seed,
+                "sampler": sampler_stats,
+            },
+        )
     return 0
 
 
 def _report(df, tag: str, ck: dict) -> None:
     from src.evaluation.retrieval_metrics import format_table
 
-    print(f"\nTwoTower-{tag}（{ck.get('steps', '?')} 步，"
-          f"loss {ck.get('loss_tail', float('nan')):.4f}）")
+    print(
+        f"\nTwoTower-{tag}（{ck.get('steps', '?')} 步，"
+        f"loss {ck.get('loss_tail', float('nan')):.4f}）"
+    )
     print(format_table(df))
     print()
     dst = project_path("results") / f"two_tower_{tag}.json"
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(json.dumps({
-        "tag": tag, "strategy": ck.get("strategy"), "seed": ck.get("seed"),
-        "item_tower_config": ck.get("item_tower_config"), "protocol": ck.get("protocol"),
-        "steps": ck.get("steps"), "loss_tail": ck.get("loss_tail"),
-        "metrics": {f"{r['metric']}@{r['k']}": {"per_request": r["per_request"],
-                                                "per_user": r["per_user"]}
-                    for r in df.iter_rows(named=True)},
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    dst.write_text(
+        json.dumps(
+            {
+                "tag": tag,
+                "strategy": ck.get("strategy"),
+                "seed": ck.get("seed"),
+                "item_tower_config": ck.get("item_tower_config"),
+                "protocol": ck.get("protocol"),
+                "steps": ck.get("steps"),
+                "loss_tail": ck.get("loss_tail"),
+                "sampler": ck.get("sampler"),
+                "metrics": {
+                    f"{r['metric']}@{r['k']}": {
+                        "per_request": r["per_request"],
+                        "per_user": r["per_user"],
+                    }
+                    for r in df.iter_rows(named=True)
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     log.info("结果已写出 %s", dst.name)
 
 

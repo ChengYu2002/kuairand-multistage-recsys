@@ -52,13 +52,24 @@ PAD, OOV = 0, 1
 
 
 class RetrievalData:
-    def __init__(self, proc: Path, protocol: str, split: str, max_hist: int = 50,
-                 mask_oov: bool = True, load_item_t1: bool = False) -> None:
+    def __init__(
+        self,
+        proc: Path,
+        protocol: str,
+        split: str,
+        max_hist: int = 50,
+        mask_oov: bool = True,
+        load_item_t1: bool = False,
+    ) -> None:
         self.proc, self.protocol, self.split = Path(proc), protocol, split
         self.max_hist, self.mask_oov = max_hist, mask_oov
         self.load_item_t1 = load_item_t1
-        spec = json.loads((self.proc / f"encoder_spec_{protocol}.json").read_text("utf-8"))
-        cols = json.loads((self.proc / f"feat_columns_{protocol}.json").read_text("utf-8"))
+        spec = json.loads(
+            (self.proc / f"encoder_spec_{protocol}.json").read_text("utf-8")
+        )
+        cols = json.loads(
+            (self.proc / f"feat_columns_{protocol}.json").read_text("utf-8")
+        )
 
         # ---- T-1 特征矩阵（row 0 = 冷启动行）----
         self.user_t1 = np.load(self.proc / f"feat_user_encoded_{protocol}.npy")
@@ -66,17 +77,28 @@ class RetrievalData:
         # 默认不加载 —— 1K 上它是 0.32 GB 的常驻 + 每个 batch 的无用 gather，
         # 27K 上会成为大头。排序阶段（⑬）需要时显式传 load_item_t1=True。
         self.item_t1 = (
-            np.load(self.proc / f"feat_item_encoded_{protocol}.npy") if load_item_t1 else None
+            np.load(self.proc / f"feat_item_encoded_{protocol}.npy")
+            if load_item_t1
+            else None
         )
         self.user_t1_cols = cols["user"]
         self.item_t1_cols = cols["item"]
 
         # ---- 静态特征 ----
-        us = pl.read_parquet(self.proc / f"feat_user_static_{protocol}.parquet").sort("user_id")
-        num = [c for c in us.columns
-               if c != "user_id" and spec["columns"].get(c, {}).get("kind") == "numeric"]
-        cat = [c for c in us.columns
-               if c != "user_id" and spec["columns"].get(c, {}).get("kind") == "categorical"]
+        us = pl.read_parquet(self.proc / f"feat_user_static_{protocol}.parquet").sort(
+            "user_id"
+        )
+        num = [
+            c
+            for c in us.columns
+            if c != "user_id" and spec["columns"].get(c, {}).get("kind") == "numeric"
+        ]
+        cat = [
+            c
+            for c in us.columns
+            if c != "user_id"
+            and spec["columns"].get(c, {}).get("kind") == "categorical"
+        ]
         self.user_static_num = us.select(num).to_numpy().astype(np.float32)
         self.user_static_cat = us.select(cat).to_numpy().astype(np.int64)
         self.user_static_num_cols, self.user_static_cat_cols = num, cat
@@ -84,12 +106,18 @@ class RetrievalData:
             spec["categorical"][c]["cardinality"] for c in cat
         ]
 
-        it = pl.read_parquet(self.proc / f"feat_item_static_{protocol}.parquet").sort("video_index")
+        it = pl.read_parquet(self.proc / f"feat_item_static_{protocol}.parquet").sort(
+            "video_index"
+        )
         n_vocab = int(it["video_index"].max()) + 1
         self.item_author = np.zeros(n_vocab, np.int64)
         self.item_author[it["video_index"].to_numpy()] = it["author_index"].to_numpy()
         self.item_duration = np.zeros(n_vocab, np.float32)
-        d = it["duration_ms"].fill_null(spec["columns"]["duration_ms"]["fill"]).to_numpy()
+        d = (
+            it["duration_ms"]
+            .fill_null(spec["columns"]["duration_ms"]["fill"])
+            .to_numpy()
+        )
         self.item_duration[it["video_index"].to_numpy()] = d
         self.item_has_duration = np.zeros(n_vocab, np.float32)
         self.item_has_duration[it["video_index"].to_numpy()] = (
@@ -116,8 +144,11 @@ class RetrievalData:
         self.date = s["date"].to_numpy().astype(np.int64)
         self.tab = s["tab"].to_numpy().astype(np.int64)
         self.hour = (s["hourmin"].to_numpy().astype(np.int64) // 100).clip(0, 23)
-        self.labels = {c: s[c].to_numpy().astype(np.float32)
-                       for c in s.columns if c.startswith("is_") or c == "long_view"}
+        self.labels = {
+            c: s[c].to_numpy().astype(np.float32)
+            for c in s.columns
+            if c.startswith("is_") or c == "long_view"
+        }
 
         # ---- 历史：按 (user_id, time_ms) 去重后补成定宽矩阵 ----
         mom = (
@@ -126,16 +157,22 @@ class RetrievalData:
             .sort(["user_id", "time_ms"])
             .with_row_index("hist_row")
         )
-        self.hist = _pad_ragged(mom["hist_idx"], max_hist)             # 0 = PAD
+        self.hist = _pad_ragged(mom["hist_idx"], max_hist)  # 0 = PAD
         # 必须显式保序：polars 的 left join **不保证**输出顺序与左表一致。实测当前版本
         # 碰巧保序，但一旦变了，每个样本都会拿到别人的历史 —— 而且不会报错，因为下游
         # 用的正是这份（已错位的）映射。与 build_catalog 里 semi join 那次是同一类问题。
         self.hist_row = (
             s.select("user_id", "time_ms")
             .with_row_index("_i")
-            .join(mom.select("user_id", "time_ms", "hist_row"), on=["user_id", "time_ms"], how="left")
+            .join(
+                mom.select("user_id", "time_ms", "hist_row"),
+                on=["user_id", "time_ms"],
+                how="left",
+            )
             .sort("_i")
-            .get_column("hist_row").to_numpy().astype(np.int64)
+            .get_column("hist_row")
+            .to_numpy()
+            .astype(np.int64)
         )
 
     def __len__(self) -> int:
@@ -156,7 +193,9 @@ class RetrievalData:
             up = self.item_upload[idx]
             # age = 请求日 - 上传日。YYYYMMDD 不能直接相减，先转成序数天。
             age = _ymd_to_days(date) - _ymd_to_days(up)
-            age = np.where(up == 0, 0.0, age).astype(np.float32)     # 无上传日 -> 0，配合 has_upload
+            age = np.where(up == 0, 0.0, age).astype(
+                np.float32
+            )  # 无上传日 -> 0，配合 has_upload
             out["age"] = torch.from_numpy(np.log1p(np.clip(age, 0, None)))
             out["has_upload"] = torch.from_numpy((up != 0).astype(np.float32))
         return out
@@ -169,14 +208,22 @@ class RetrievalData:
             mask &= h != OOV
         b = {
             "user_t1": torch.from_numpy(self.user_t1[self.user_feat_row[rows]]),
-            "user_static_num": torch.from_numpy(self.user_static_num[self.user_id[rows]]),
-            "user_static_cat": torch.from_numpy(self.user_static_cat[self.user_id[rows]]),
+            "user_static_num": torch.from_numpy(
+                self.user_static_num[self.user_id[rows]]
+            ),
+            "user_static_cat": torch.from_numpy(
+                self.user_static_cat[self.user_id[rows]]
+            ),
             "hist": torch.from_numpy(h),
             "hist_mask": torch.from_numpy(mask),
             "hist_len": torch.from_numpy(mask.sum(1).astype(np.float32)),
             "tab": torch.from_numpy(self.tab[rows]),
             "hour": torch.from_numpy(self.hour[rows]),
             "target": torch.from_numpy(self.target[rows]),
+            # exposure / hybrid 负采样要知道"这是谁"，才能取他自己的曝光。
+            # 纯新增键：不进任何塔的前向、不进 loss、不消耗随机数发生器，
+            # 所以 random / inbatch 的结果逐位不变（scripts/prove_noop.py 实测）。
+            "user_id": torch.from_numpy(self.user_id[rows]),
         }
         if self.item_t1 is not None:
             b["item_t1"] = torch.from_numpy(self.item_t1[self.item_feat_row[rows]])

@@ -3,20 +3,28 @@
 > Industrial-style multi-objective short-video recommendation system built on KuaiRand:
 > global temporal splitting, T-1 feature snapshots, two-tower retrieval, and multi-task ranking.
 
-**状态：🚧 Week 3 收尾 —— 排序侧五个模型 × 3 seeds 全部完成；召回侧待补。**
+**状态：🚧 Week 3 完成 —— 两个核心研究问题的主实验均已跑齐 3 seeds。**
 完整设计见本地个人笔记 `note/plan_architecture.md`（不入库）。
 
-已完成：数据管线、候选库与词表、召回指标、ItemCF、全库检索、双塔（random / in-batch）、
+已完成：数据管线、候选库与词表、召回指标、ItemCF、全库检索、
+**双塔四种负采样（random / in-batch / exposure / hybrid，各 3 seeds）**、
 排序侧物品元数据、User x Author 偏好特征（§8.4）、排序指标（AUC / GAUC / PCOC / 校准）、
 Single-Task、MMoE、CGC、PLE、Selective Sharing（**各 3 seeds**，只评 valid）。
-未完成：召回侧 exposure / hybrid 负采样、random / in-batch 补到 3 seeds、ID + Side
-物品塔训练；排序侧 P1 的 User x Tag 偏好（§8.5）；以及横跨两条轨道的 27K 迁移与最终
-test 段评估。
+未完成：召回侧 ID + Side 物品塔训练（§7.2）与 Warm/Cold/Tail 分层、logQ 校正（P1）、
+hybrid 混合比例扫描；排序侧 P1 的 User x Tag 偏好（§8.5）；以及横跨两条轨道的
+27K 迁移与最终 test 段评估。
 
 > ⚠️ **稀疏任务上的细微差异仍受样本量限制。** valid 的 is_follow 只有 1,457 个正样本、
 > 395 个可算 GAUC 的用户，平均每人 3.7 个正样本；增加 seed 能改善跨 seed 均值的不确定性，
 > 但不能补足每用户的正样本。1K 已能读出 Selective Sharing 的强负迁移，MMoE / CGC / PLE
 > 之间更细微的 follow / comment 差异仍需 27K 验证。
+
+> ⚠️ **召回指标的 `per_user` 口径不是逐位可复现的。** 同一份代码、同一个 checkpoint
+> 连跑两次评估，18 个指标项里有 5 项不同，全部在 `per_user`，最大相对差 **1.9e-16**；
+> `per_request` 在所有重跑之间**逐位相同**。成因是按用户平均要在变长分组上求和，
+> 归约顺序随线程调度变。相对误差 1e-16 对效应量 1e-3 的结论没有影响，5 位小数下
+> 两两一致，但「同 seed 同结果」对 `per_user` 只成立到约 16 位 —— 做逐位比对的
+> 回归检查（如证明某次改动是 no-op）必须用 `per_request`，否则会得到假阳性。
 
 ---
 
@@ -152,19 +160,106 @@ Day T 的样本只允许使用 **Day T-1 及更早**日志生成的聚合特征�
   考题共享同一份 Top-K。
 
 **四种负采样策略对比** —— 同一候选库、同一考题集、除负采样外所有变量固定（§16.6）。
-20,000 步，embedding_dim 64，temperature 0.05，10 负样本/正样本，item tower = ID-only：
+20,000 步，embedding_dim 64，temperature 0.05，10 负样本/正样本，item tower = ID-only。
+**3 seeds（42/43/44），mean ± std，按 request 平均**；汇总由
+`python -m src.evaluation.negative_sampling_analysis` 复现：
 
-| Strategy | Recall@50 | Recall@100 | Recall@500 | NDCG@100 | 末 100 步 loss |
+| Strategy | Recall@50 | Recall@100 | Recall@500 | 倍热度基线(@100) | 末 100 步 loss |
 |---|---:|---:|---:|---:|---:|
-| **Random** | **0.00513** | **0.00888** | **0.03523** | **0.00196** | 0.2476 |
-| In-batch | 0.00277 | 0.00531 | 0.02579 | 0.00112 | 0.2977 |
-| Exposure | *未实现* | | | | |
-| Hybrid | *未实现* | | | | |
+| **Random** | **0.00488±0.00027** | **0.00883±0.00017** | **0.03481±0.00073** | **1.80x** | 0.2448±0.0032 |
+| In-batch | 0.00288±0.00021 | 0.00558±0.00036 | 0.02463±0.00114 | 1.14x | 0.2922±0.0080 |
+| *Popularity 基线* | *0.00222* | *0.00490* | *0.02301* | *1.00x* | — |
+| Hybrid (5 Random + 5 Exposure) | 0.00183±0.00013 | 0.00350±0.00024 | 0.01525±0.00055 | 0.71x | 0.2635±0.0149 |
+| Exposure | 0.00023±0.00005 | 0.00046±0.00001 | 0.00227±0.00019 | 0.09x | 0.0788±0.0111 |
 
-Random 达到热度基线的 **1.81 倍**，In-batch 仅 1.08 倍。
+配对差值（同 seed 相减，seed 是受控的区组因子）：
 
-> ⚠️ **当前结果只有 seed 42 一个种子。** Random 与 In-batch 的差距有多少来自种子噪声
-> 尚未验证；§26 要求的 3 seeds + mean ± std 对负采样对比同样适用，报告前必须补齐。
+| vs Random | Recall@50 | Recall@100 | Recall@500 | 方向一致性 |
+|---|---:|---:|---:|---|
+| In-batch | −0.00200±0.00031 | −0.00325±0.00030 | −0.01018±0.00135 | 3/3 同号 |
+| Hybrid | −0.00306±0.00014 | −0.00533±0.00011 | −0.01956±0.00075 | 3/3 同号 |
+| Exposure | −0.00466±0.00028 | −0.00838±0.00017 | −0.03254±0.00055 | 3/3 同号 |
+
+9 格全部 3/3 同号，`|mean|/std` 从 6.5 到 59.2；`per_user` 口径给出完全一致的排序。
+不打「显著/不显著」标记 —— 3 个 seed 估出的 std 本身不可靠（§26）。
+
+**主结论：在当前 1K、ID-only、Protocol A 的全库召回实验里，负样本的「候选库覆盖度」
+比「难度」重要得多。**
+四种策略的排序 `Random 1.80x > In-batch 1.14x > 热度基线 1.00x > Hybrid 0.71x >
+Exposure 0.09x` 与一个清楚的假设一致：采样分布越局限在「已曝光集合」，训练目标就越
+偏离全库检索。这里没有为四种分布定义统一的距离，因此不把它写成已证明的「单调定律」。
+本数据上的性能方向在 3 个 seed 中一致（Exposure 的 std 仅 0.00001）。
+
+**In-batch 的采样偏差被量出来了，而且方向与直觉相反。** 它整体只比「给所有人推同一份
+榜单」高 14%（@100）、7%（@500）；但 §7.2 的频次分层显示这不是均匀变差，而是一次
+**用 warm 换 tail** 的交易：
+
+    R@100 倍随机猜      tail      mid     warm
+    Random              5.7x     15.3x    36.8x
+    In-batch           10.6x     12.9x     7.6x
+
+In-batch 在 tail 层（`train_freq` 5~9）**反超 Random 1.85 倍**（0.00544 vs 0.00294），
+却在 warm 层只剩 Random 的 **20.5%**（0.00389 vs 0.01893）。成因是**热门 item 被过度
+惩罚**：in-batch 的负样本概率正比于该 item 的正样本频率，于是越热门的 item 被压低的
+次数越多。这与「学到了全局热度排序」恰好相反 —— 实测 `ū·v_i` 与 `train_freq` 的
+Spearman ρ 从 Random 的 **+0.549** 降到 In-batch 的 **+0.202**，热度分量被削弱而非强化。
+这正是 logQ 校正（从 logit 中减去 `log Q(item)`）要修的那个偏差；本项目
+**未实现**它（`negative_sampling.logq_correction`，P1），但量出了不修的代价与方向。
+
+**Exposure 单独使用会摧毁全库召回，机制已定位。** 它的 Recall 只有 Random 的 5.2%，
+比热度基线还低一个数量级，而它的 loss 却低一个量级（0.079 vs 0.245）——
+这是「训练目标与评估任务错配」最干净的证据：模型把「在这个用户看过的约 641 个视频里
+挑出他点过的那个」学得极好，而评估问的是「从 19.4 万里挑」。
+
+下面三组是探索性诊断（单 seed；原始诊断脚本未纳入仓库），用于解释现象，不作为主实验
+判据：
+
+| 量 | Random | In-batch | Hybrid | Exposure |
+|---|---:|---:|---:|---:|
+| 推荐 Top-100 的 `train_freq` 中位 | 15 | — | 11 | 8 |
+| `ū·v_i` 与 `train_freq` 的 Spearman ρ | **+0.549** | +0.202 | +0.466 | **−0.231** |
+| 物品向量的全局分量占方差 | 0.0852 | 0.0463 | 0.0330 | 0.0245 |
+
+`ū·v_i` 是「与用户无关的那一份得分」。**Exposure 学出来的全局分量与热度负相关** ——
+它主动偏好冷门视频，推荐分布（中位 `train_freq` 8）塌到候选库自身的分布（8）上，
+而考题答案的中位是 14、Random 的推荐中位是 15。成因是曝光负样本的采样概率正比于
+「有多少用户被推过它」，而热门视频被推给更多人，于是热门视频被系统性地多压 ——
+实测 `p_exposure` 与正样本频率的 Spearman ρ = 0.286。全库召回最需要的那个
+「这个视频普遍值得推」的先验，被它学成了负的。
+
+> **两个被否掉的假设，记录在此以免重走。**
+> ① 「大量 item 从没当过负样本因而霸榜」—— 否：曝光池覆盖候选库的 97.9%，
+> 零负样本的只有 4,125 个。
+> ② 「曝光负样本抵消了热度信号」—— 否：`pos/neg` 比值的动态范围在 Exposure 下反而
+> 更大（119.8%）。该量被冷门 item 的噪声主导，**量错了对象**；正确的对象是模型
+> **学出来的**全局分量。
+
+> **最后一行（全局分量占方差）与 Recall 严格单调，但不作判据。** 它是 4 个点、
+> 1 个 seed 上的观察，且缺一个「为什么是这一列而不是 ρ」的机制解释 —— 注意 Hybrid 的
+> ρ（+0.466）接近 Random（+0.549），Recall 却差一倍多，说明热度先验不是全部。
+> 作为观察记录保留，补足 3 seeds 之前不进结论。
+
+**自然的后续实验：扫混合比例。** 当前只证明了 `hybrid_mix = 0.5` 在这个设置下过重，
+不能外推为「任何 Hybrid 都无效」。扫 0.05 / 0.1 / 0.2 / 0.5 能给出转折点，比再加一种
+策略更有信息量。未做。
+
+> ⚠️ **§16.6 可比性：有一层保护是空的。** 结果 JSON 只记录了 `strategy / seed /
+> protocol / item_tower_config / steps / loss_tail / metrics`。`lr`、`batch_size`、
+> `negatives_per_positive`、`temperature`、`optimizer` **未逐次落盘**，无法事后断言
+> 它们在 12 次训练间相同 —— 排序侧有 `input_fingerprint` 挡着，召回侧没有这个机制。
+> **已确认（由权重形状复原）**：12 个 checkpoint 的参数张量名字与形状逐一相同，
+> `catalog_range` 与 `steps` 一致，这覆盖了架构、`embedding_dim`、两座塔层宽与
+> `share_item_embedding`。
+> **已知缺口**：`configs/retrieval.yaml` 最后写入 2026-09-25 23:51，晚于 Random /
+> In-batch 的 seed 42 跑完时间（21:07 / 21:52）。那两次用的配置无法从 git 复原
+> —— 同一个提交里既新增了键又改写了注释，提交内的时间线不存在。
+> 由于 `two_tower.py` 缺 `temperature` / `train_target_scope` 会直接 KeyError，
+> 那两次跑时这些键必然已存在；但「必然存在」不等于「值相同」，故如实记录为缺口。
+
+> ⚠️ **Exposure 的 fallback**：空池子用户 9/1,000（0.90%），但逐行实测 fallback
+> 仅 **47/20,480,000 = 0.00023%** —— 那 9 个用户中只有 2 个在训练段出现过，共贡献
+> 3 条训练正样本。Exposure 实际上是纯的，上述崩溃与 fallback 无关。
+> 比例随结果落盘（checkpoint 的 `sampler` 字段），可独立核对。
 
 训练与评估口径：正样本取 train 段正向事件且目标落在候选库内（121 万条，占全部正样本
 的 58%）。**正负样本必须同空间** —— 若正样本可在词表任意位置而负样本只来自候选库，
@@ -172,10 +267,58 @@ Random 达到热度基线的 **1.81 倍**，In-batch 仅 1.08 倍。
 
 ### 7.2 Item Tower / Cold Start
 
-| Item Tower | Overall R@100 | Warm R@100 | Cold R@100 | Tail R@100 |
+**Protocol A 按构造没有 cold item，这一列填不出来。** 候选库的定义是「train 段出现过
+且 `train_freq >= 5`」，实测候选库 `train_freq` 最小值就是 5，66,536 条考题的答案
+**全部**落在候选库内（库外 0 条）。冷启动需要 Protocol B（time-aware available
+catalog，含训练期从未出现的 item），而 `catalog.upload_rule` 标着「Protocol B 用，
+未实现」。§6 记录的天花板正来自这里 —— 测试期 **78.1%** 的正向事件，其目标 item 在
+训练段一次都没出现过，这些事件连考题都进不了。本节量的是**剩下 21.9% 内部的频次
+梯度**，不是冷启动，两者不能混。
+
+**频次分层口径**（切点在看到任何 Recall 之前定好，之后未调整）。按**考题答案**的
+`train_freq` 切三段，用绝对值而非分位数 —— 分位数会随候选库变化（aux 协议
+`min_train_freq=1`、将来的 Protocol B），那样跨协议不可比：
+
+| band | `train_freq` | 考题数 | 占比 |
+|---|---|---:|---:|
+| tail | 5 ≤ f < 10 | 22,675 | 34.1% |
+| mid | 10 ≤ f < 30 | 27,928 | 42.0% |
+| warm | f ≥ 30 | 15,933 | 23.9% |
+| *cold* | *未在 train 出现* | *0* | *Protocol A 不含* |
+
+**分母必须是随机猜，不能是热度基线。** 实测热度基线在 tail 与 mid 层**恒为 0**，
+且这是结构性的：热度 Top-500 全部是 `train_freq >= 114` 的 item，按定义都在 warm 层，
+永远打不中 tail/mid 的答案（它的全部战绩来自 24% 的 warm 考题，warm R@100 = 0.02046）。
+随机猜才与层无关：每条考题一个答案，随机取 K 个命中的概率是 `K/194,310`
+（@50/100/500 = 0.000257 / 0.000515 / 0.002573）。
+
+**ID-only 物品塔，四种负采样 × 3 seeds，R@100 per_request（倍随机猜）**
+—— 由 `python -m src.analysis.cold_start_analysis` 复现：
+
+| Strategy | tail R@100 | mid R@100 | warm R@100 | tail / mid / warm 倍随机猜 |
+|---|---:|---:|---:|---|
+| **Random** | 0.00294±0.00052 | 0.00785±0.00025 | **0.01893±0.00076** | 5.7x / 15.3x / **36.8x** |
+| In-batch | **0.00544±0.00064** | 0.00666±0.00038 | 0.00389±0.00085 | **10.6x** / 12.9x / 7.6x |
+| Hybrid | 0.00257±0.00025 | 0.00442±0.00060 | 0.00322±0.00020 | 5.0x / 8.6x / 6.3x |
+| Exposure | 0.00056±0.00014 | 0.00043±0.00006 | 0.00036±0.00025 | 1.1x / 0.8x / 0.7x |
+
+三条读得出来的结论：
+
+- **Random 的优势全部来自 warm 层，且随频次单调上升**（5.7x → 15.3x → 36.8x）。
+  它学到的是正确方向的热度先验。
+- **In-batch 是一次 warm 换 tail 的交易**，不是均匀变差：tail 层反超 Random 1.85 倍，
+  warm 层只剩 20.5%。方向与「in-batch 偏向热门」的直觉相反，机制见 §7.1。
+- **Exposure 在三层上全都约等于随机猜**（0.7x ~ 1.1x），没有层内优势可言 ——
+  它不是「偏向某一层」，是整体不含信息。
+
+| Item Tower | Overall R@100 | tail R@100 | mid R@100 | warm R@100 |
 |---|---:|---:|---:|---:|
-| ID-only | | | | |
-| ID + Side Features | | | | |
+| ID-only（Random 负采样） | 0.00883±0.00017 | 0.00294±0.00052 | 0.00785±0.00025 | 0.01893±0.00076 |
+| ID + Side Features | *未训练* | | | |
+
+> ID + Side 的对比尚未跑（`item_tower_config: id_side` 已实现，未训练）。预期它的增益
+> 应集中在 tail 层 —— 低频 item 的 ID embedding 只吃到 5~9 次梯度，而侧信息
+> （author / tag / duration / video_age）是跨 item 共享的。这个预期**尚未验证**。
 
 ### 7.3 Multi-task Ranking
 
