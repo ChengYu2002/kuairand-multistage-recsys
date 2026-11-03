@@ -1,0 +1,47 @@
+{
+  "written_at": "2026-10-30 22:22:47",
+  "git_head": "ebe0e86",
+  "purpose": "补 n_neg=5 的 seed 43/44 之前写死预测，跑完逐条对账。§7.1 的 logq_prediction.json 是同一套做法；对话里说过的预期不算。",
+  "contrast": {
+    "baseline": "inbatch_logq_id_side_main (n_neg=10, 3 seeds, 已跑完)",
+    "treatment": "inbatch_logq_id_side_main_neg5 (n_neg=5)",
+    "seeds_to_run": [
+      43,
+      44
+    ],
+    "controlled": "同塔 id_side / 同策略 inbatch_logq / 同 lr / batch_size=1024 / temperature / 20000 步 / 同候选库与考题集；唯一自变量是 n_neg"
+  },
+  "bar": "|mean|/std >= 2.0 才进结论。这是本项目的既有口径：§7.1 把 1.9 明确判为「3 个 seed 撑不住」，§7.2 把 1.15 降级为「只作记录」。不打显著性标记。",
+  "predictions": {
+    "recall@50": {
+      "seed42_paired_diff": 0.000767,
+      "reference_paired_std": 0.000316,
+      "seed42_ratio": 2.43,
+      "predicted_3seed_mean_diff": 0.000767,
+      "predicted_abs_mean_over_std": 2.4,
+      "clears_bar_2.0": true,
+      "baseline_seed42_draw_in_sd": -0.93
+    },
+    "recall@100": {
+      "seed42_paired_diff": 0.000391,
+      "reference_paired_std": 0.000418,
+      "seed42_ratio": 0.94,
+      "predicted_3seed_mean_diff": 0.000391,
+      "predicted_abs_mean_over_std": 0.9,
+      "clears_bar_2.0": false,
+      "baseline_seed42_draw_in_sd": 0.11
+    },
+    "recall@500": {
+      "seed42_paired_diff": 0.000962,
+      "reference_paired_std": 0.000266,
+      "seed42_ratio": 3.62,
+      "predicted_3seed_mean_diff": 0.000962,
+      "predicted_abs_mean_over_std": 3.6,
+      "clears_bar_2.0": true,
+      "baseline_seed42_draw_in_sd": 1.01
+    }
+  },
+  "falsification": "若 R@500 的配对差值在 seed 43 或 44 上变号，则 seed 42 的 3.6 倍是噪声，结论改为「n_neg 在 5~30 区间内对所有指标都不敏感，真正有效应的只有推到 1023」。这比确认一个 2% 的优势更值得记录。",
+  "self_assigned_failure": "R@50 预计回落。seed42 基线在 R@50 上是 -0.93 sd 的低抽（三个 seed 里最低），所以 2.4 倍里有一部分是抽样偏向而非效应。若补 seed 后 R@50 的 |mean|/std 明显低于 2.4，就是「单 seed 筛选会被该 seed 的抽样偏向带跑」的一个实测案例。",
+  "not_answerable": "中段 U 形（R@50/R@100 上 n_neg=10 是 5/10/30 里最低者）无法由本次回答：实测深度 1.0~1.9σ，3 个 seed 下只有 1.7 个标准误。需要 10 个seed 量级，不做。"
+}

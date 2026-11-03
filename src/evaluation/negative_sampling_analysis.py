@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -56,7 +57,7 @@ from src.utils.logger import get_logger
 log = get_logger(__name__)
 
 BASELINE = "random"
-STRATEGY_ORDER = ("random", "inbatch", "hybrid", "exposure")
+STRATEGY_ORDER = ("random", "inbatch", "inbatch_logq", "hybrid", "exposure")
 UNITS = ("per_request", "per_user")
 # 结果 JSON 里确实记录了、因而可以断言的字段
 RECORDED_KEYS = ("protocol", "item_tower_config", "steps")
@@ -82,7 +83,18 @@ def load_runs(results: Path, protocol: str, tower: str) -> dict[str, dict[int, d
             continue
         if r.get("protocol") != protocol or r.get("item_tower_config") != tower:
             continue
+        # 这张表回答固定 n_neg=10 的五臂负样本来源实验。完整 in-batch 是独立的
+        # 负样本规模实验；若混进来，不仅 seed 集合暂时不齐，还会把 §16.6 的
+        # 「除来源外一切固定」改成同时比较来源与数量。
+        if r["strategy"] not in STRATEGY_ORDER:
+            continue
         if "smoke" in str(r.get("tag", "")):
+            continue
+        # `_neg{n}` 是负样本**数量**扫描的产物。它的 strategy 仍是 inbatch_logq、
+        # seed 仍是 42，所以不挡的话它会按 (strategy, seed) 覆盖掉 n_neg=10 的那一份
+        # —— 而 glob 的字典序让 `_seed42_neg30` 排在 `_seed42` 之后，它会赢。
+        # 这与上面挡掉完整 in-batch 是同一个理由：这张表的自变量只有「来源」一个。
+        if re.search(r"_neg\d+(_|$)", str(r.get("tag", ""))):
             continue
         runs[r["strategy"]][int(r["seed"])] = r
     return runs
@@ -165,7 +177,10 @@ def main() -> int:
     ap.add_argument(
         "--no-check-arch",
         action="store_true",
-        help="跳过读 12 个 checkpoint 的架构检查（省约 30 秒，但保护也少一层）",
+        help="跳过逐个读 checkpoint 的架构检查（省约 30 秒，但保护也少一层）",
+    )
+    ap.add_argument(
+        "--force", action="store_true", help="允许覆盖基准不同或范围更大的现有汇总"
     )
     a = ap.parse_args()
 
@@ -315,12 +330,37 @@ def main() -> int:
         "那两次用的配置无法从 git 复原（同一提交内既加键又改注释）。"
     )
     if meta.get("arch_param_shapes_identical"):
+        n_ck = sum(len(v) for v in meta["seeds"].values())
         print(
-            "  已确认（由权重形状）：12 个 checkpoint 的参数张量名字与形状逐一相同，"
-            "catalog_range 与 steps 一致。"
+            f"  已确认（由权重形状）：{n_ck} 个 checkpoint 的参数张量名字与形状"
+            "逐一相同，catalog_range 与 steps 一致。"
         )
 
     dst = results / f"negative_sampling_summary_{a.protocol}_{a.tower}.json"
+    # 文件名不含 baseline，内容却含（delta_vs_<baseline>_paired）：换基准重跑会把
+    # 原有那份静默覆盖，范围更小的一次运行同样会。与 cold_start_analysis 同一护栏。
+    if dst.exists() and not a.force:
+        try:
+            old = json.loads(dst.read_text("utf-8"))
+        except (ValueError, OSError):
+            old = {}
+        if old.get("baseline") not in (None, a.baseline):
+            raise SystemExit(
+                f"拒绝覆盖 {dst.name}：现有文件的基准是 {old['baseline']!r}，"
+                f"本次是 {a.baseline!r}，配对差值的含义不同。"
+                "要换基准请加 --force，或先把现有文件挪开。"
+            )
+        old_seeds = (old.get("meta") or {}).get("seeds") or {}
+        lost = {
+            m: sorted(set(v) - set(meta["seeds"].get(m, [])))
+            for m, v in old_seeds.items()
+        }
+        lost = {m: s for m, s in lost.items() if s or m not in meta["seeds"]}
+        if lost:
+            raise SystemExit(
+                f"拒绝覆盖 {dst.name}：现有文件覆盖的范围更大，本次会丢掉 {lost}。"
+                "确实要覆盖请加 --force。"
+            )
     dst.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("汇总已写出 %s", dst.name)
     return 0

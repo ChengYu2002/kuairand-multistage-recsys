@@ -28,9 +28,20 @@ log = get_logger(__name__)
 SAMPLERS = {
     "random": RandomNegative,
     "inbatch": InBatchNegative,
+    # §16.5 的第五个实验臂：**同一个 in-batch 采样器**，只是 loss 里多了 logQ 校正。
+    # 必须是独立的 strategy 名而不是 inbatch 的一个开关 —— 产物名由 strategy 拼成，
+    # 共用名字会让 inbatch_logq 的 checkpoint 覆盖掉已跑完的 inbatch。
+    "inbatch_logq": InBatchNegative,
+    # 独立的负样本规模实验：不再抽固定 n_neg 个位置，而是让 batch 中其余
+    # B-1 个 target 全部参与 softmax。训练入口由 full_inbatch.py 接管；这里仍
+    # 注册同一个类，使 strategy 的 CLI、产物命名与统一构造入口保持一致。
+    "inbatch_full_logq": InBatchNegative,
     "exposure": ExposureNegative,
     "hybrid": HybridNegative,
 }
+# 这些策略在 loss 里做 logQ 校正（Q 的口径见 src/retrieval/logq_correction.py）
+USES_LOGQ = ("inbatch_logq", "inbatch_full_logq")
+FULL_INBATCH = ("inbatch_full_logq",)
 # 需要曝光池的策略。其余策略的构造路径必须保持与改动前完全一致。
 NEEDS_POOL = ("exposure", "hybrid")
 

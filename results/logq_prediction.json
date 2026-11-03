@@ -1,0 +1,25 @@
+{
+  "_说明": "在 inbatch_logq 任何一次正式训练开始之前写死的预测（plan §16.5）。事后解释不算预测。",
+  "写于": "2026-10-29，inbatch_logq 尚未跑任何正式 seed",
+  "基准": {
+    "来源": "results/cold_start_summary_main_id_only.json + negative_sampling_summary_main_id_only.json",
+    "inbatch_R@100_倍随机猜": {"tail": 10.6, "mid": 12.9, "warm": 7.6},
+    "random_R@100_倍随机猜": {"tail": 5.7, "mid": 15.3, "warm": 36.8},
+    "inbatch_overall_R@100": 0.00558,
+    "random_overall_R@100": 0.00883,
+    "rho_ubar_v_vs_train_freq": {"inbatch": 0.202, "random": 0.549}
+  },
+  "主预测": [
+    "warm 层 R@100 明显高于 inbatch 的 7.6x（3 seeds 配对差值同向为正）",
+    "rho(ū·v_i, train_freq) 从 inbatch 的 +0.202 回升",
+    "对热门物品的过度惩罚减弱 —— 即 warm 层的相对劣势缩小"
+  ],
+  "次预测": [
+    "tail 层的 10.6x 可能回落（in-batch 原本的 tail 优势正来自同一个偏差）",
+    "overall R@100 上升，但**不保证**超过 random 的 0.00883"
+  ],
+  "关键说明": "若 warm 恢复而 overall 仍不及 random，实验依然成功：说明修对了一个机制，但 in-batch 还受限于只有 10 个负样本、覆盖度远不及全库均匀采样。这两件事是分开的。",
+  "证伪条件": "warm 层不回升（或反而更低），则机制诊断错误 —— 那比任何新数字都值得记录。",
+  "协议": {"seeds": [42, 43, 44], "steps": 20000, "item_tower": "id_only", "protocol": "main",
+           "与 inbatch 的唯一差异": "loss 中的 logQ 校正；采样器、架构、步数、batch、temperature 全同"}
+}

@@ -291,8 +291,8 @@ def main() -> int:
     # ---------- I. 不影响已有策略 ----------
     print("\n[I] random / inbatch 的构造路径未被改动")
     check(
-        set(SAMPLERS) == {"random", "inbatch", "exposure", "hybrid"},
-        f"四种策略全部注册：{sorted(SAMPLERS)}",
+        set(SAMPLERS) == {"random", "inbatch", "inbatch_logq", "exposure", "hybrid"},
+        f"五种实验臂全部注册：{sorted(SAMPLERS)}",
     )
     fake = {
         "target": torch.randint(lo, hi + 1, (256,)),

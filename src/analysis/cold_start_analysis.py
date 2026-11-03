@@ -65,7 +65,7 @@ log = get_logger(__name__)
 
 # 切点在看到 Recall 之前定好，之后不得调整（调了就是对着结果挑分层）。
 BANDS = (("tail", 5, 10), ("mid", 10, 30), ("warm", 30, None))
-STRATEGY_ORDER = ("random", "inbatch", "hybrid", "exposure")
+STRATEGY_ORDER = ("random", "inbatch", "inbatch_logq", "hybrid", "exposure")
 
 
 def band_of(freq: np.ndarray) -> np.ndarray:
@@ -80,7 +80,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/retrieval.yaml")
     ap.add_argument("--protocol", default="main", choices=("main", "aux"))
-    ap.add_argument("--tower", default="id_only", choices=("id_only", "id_side"))
+    ap.add_argument("--tower", default=None, choices=("id_only", "id_side"))
     ap.add_argument("--strategies", nargs="*", default=None)
     ap.add_argument("--seeds", nargs="*", type=int, default=[42, 43, 44])
     ap.add_argument("--results", default="results")
@@ -90,6 +90,12 @@ def main() -> int:
     a = ap.parse_args()
 
     cfg = load_config(a.config)
+    # --tower 不只决定 checkpoint 文件名，也必须决定模型结构和按日期计算
+    # item side features 的评估路径。未显式传入时必须尊重 YAML；若默认写死
+    # id_only，会把 YAML 中的 id_side 静默换回另一组 checkpoint。
+    tt = require(cfg, "two_tower")
+    tower = a.tower or tt["item_tower_config"]
+    tt["item_tower_config"] = tower
     proc = project_path(require(cfg, "data", "dataset", "processed_dir"))
     results, experiments = project_path(a.results), project_path("experiments")
     k_list = require(cfg, "eval", "k_list")
@@ -128,7 +134,7 @@ def main() -> int:
     kmax = max(k_list)
     out: dict = {
         "protocol": a.protocol,
-        "item_tower_config": a.tower,
+        "item_tower_config": tower,
         "bands": {
             b: {"lo": lo, "hi": hi, "n_requests": counts[b]} for b, lo, hi in BANDS
         },
@@ -188,14 +194,14 @@ def main() -> int:
 
     # ---- 各模型 ----
     strategies = a.strategies or [s for s in STRATEGY_ORDER]
-    data = RetrievalData(proc, a.protocol, "test")  # 只读，12 个 checkpoint 共用
+    data = RetrievalData(proc, a.protocol, "test")  # 只读，各 checkpoint 共用
     for strat in strategies:
         per_seed: dict[str, dict[str, list[float]]] = {
             b: {f"recall@{k}": [] for k in k_list} for b, _, _ in BANDS
         }
         used = []
         for seed in a.seeds:
-            tag = f"{strat}_{a.tower}_{a.protocol}_seed{seed}"
+            tag = f"{strat}_{tower}_{a.protocol}_seed{seed}"
             ck = experiments / f"two_tower_{tag}.pt"
             if not ck.exists():
                 log.warning("缺 %s，跳过", ck.name)
@@ -255,7 +261,7 @@ def main() -> int:
             line += f"{row['x_random_guess_at_ref']:>15.1f}x"
             print(line)
 
-    dst = results / f"cold_start_summary_{a.protocol}_{a.tower}.json"
+    dst = results / f"cold_start_summary_{a.protocol}_{tower}.json"
     # 局部运行（--strategies / --seeds）不得覆盖更完整的汇总：文件名不含范围，
     # 而 README 直接引用这个文件。实测踩过一次 —— 一次 1 策略 1 seed 的调试运行
     # 把 4 策略 x 3 seeds 的结果清掉了，且没有任何报错。

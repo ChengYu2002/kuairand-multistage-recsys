@@ -23,6 +23,9 @@ hybrid 时就得改别处代码，验收标准第 3 条当场失效。因此这�
           下标 -> 候选库位置 -> video_id 任何一步错位都会当场失败。
   F. 训练样本范围与端到端确定性：train_rows 的目标全在候选库内；
      同 seed 跑两次真实训练，loss 必须逐位相同（验收标准第 5 条）。
+  H. 产物命名契约：校 artifact_tag() 本身（不是手抄的字面量）。定义一次实验的每一维
+     单独改动都必须换名字，少一维就是静默覆盖已跑完的结果；而不传 n_neg 时拼出的名字
+     必须与改动前逐字相同，否则已有 15 份产物会突然对不上。
 
 用法：
     python scripts/verify_two_tower.py --config configs/retrieval.yaml
@@ -46,7 +49,7 @@ sys.path.insert(0, str(ROOT))
 from src.retrieval.dataset import RetrievalData
 from src.retrieval.inbatch_negative import InBatchNegative
 from src.retrieval.random_negative import RandomNegative
-from src.retrieval.two_tower import TwoTower, train_rows
+from src.retrieval.two_tower import TwoTower, artifact_tag, train_rows
 from src.utils.config import load_config, project_path, require
 from src.utils.seed import set_seed
 
@@ -235,13 +238,48 @@ def main() -> int:
           "下标映射回 video_id 后与考题目标一致（这一步错位会静默给出随机水平的 Recall）")
     del iv, m_rand
 
+    print("\n=== H. 产物命名契约 ===")
+    # 这一段校的是 artifact_tag() 本身，不是手抄的字面量 —— 命名规则一改，这里必须跟着响。
+    base = artifact_tag("inbatch_logq", "id_side", "main", 42)
+    check(
+        base == "inbatch_logq_id_side_main_seed42",
+        f"不传 n_neg 时与改动前逐字相同：{base}（已有 15 份产物不用改名）",
+    )
+    scan = {
+        n: artifact_tag("inbatch_logq", "id_side", "main", 42, n_neg_override=n)
+        for n in (5, 10, 30, 50)
+    }
+    check(
+        base not in scan.values(),
+        f"显式扫描的名字**不会**撞上基线：{base} 不在 {sorted(scan.values())} 里",
+    )
+    check(len(set(scan.values())) == 4, f"不同 n_neg 互异：{sorted(scan.values())}")
+    # 五个维度逐个单独改动，都必须改变名字。少任何一维就是一次静默覆盖。
+    dims = {
+        "strategy": artifact_tag("inbatch", "id_side", "main", 42),
+        "item_tower": artifact_tag("inbatch_logq", "id_only", "main", 42),
+        "protocol": artifact_tag("inbatch_logq", "id_side", "aux", 42),
+        "seed": artifact_tag("inbatch_logq", "id_side", "main", 43),
+        "n_neg": scan[30],
+        "smoke": artifact_tag("inbatch_logq", "id_side", "main", 42, smoke_steps=200),
+    }
+    for dim, got in dims.items():
+        check(got != base, f"只改 {dim} 就换名字：{got}")
+    check(
+        len(set(dims.values()) | {base}) == len(dims) + 1,
+        "六个维度两两不互相撞名",
+    )
+
     print(f"\n共校验 {checks} 项，失败 {len(failures)} 项。")
     if failures:
         print("双塔（损失与负采样）验算未通过：")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("双塔验算通过（闭式解 / accidental hit / 采样契约 / 归一化 / 梯度 / 确定性 / 评估链路）。")
+    print(
+        "双塔验算通过（闭式解 / accidental hit / 采样契约 / 归一化 / 梯度 / "
+        "确定性 / 评估链路 / 产物命名）。"
+    )
     return 0
 
 

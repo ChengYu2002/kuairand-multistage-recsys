@@ -12,6 +12,8 @@ experiments/*
 results/*
 !experiments/.gitkeep
 !results/.gitkeep
+# 预测文件是证据不是产物：README 的事后对账表直接引用它们，必须可核对。
+!results/*_prediction.json
 *.ckpt
 *.pt
 *.pth
@@ -38,3 +40,7 @@ env/
 
 # Personal learning notes
 /note/
+
+# 本地临时产物（训练日志、PDF 预览等）。**里面可能有个人文件**，
+# 不加这条的话一次 `git add -A` 就会把它们提交进公开仓库。
+tmp/

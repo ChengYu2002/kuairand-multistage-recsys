@@ -156,7 +156,8 @@ two_tower:
                                  # 并非完全浪费；而 121 万 x 17 遍（2 万步 x 1024）也够训。
 
 negative_sampling:
-  strategy: random               # random | inbatch | exposure | hybrid
+  strategy: random               # 五臂主实验：random | inbatch | inbatch_logq | exposure | hybrid
+                                 # 独立规模实验：inbatch_full_logq（B-1 个位置，不进五臂表）
   hybrid_mix: {random: 0.5, exposure: 0.5}
   logq_correction: false         # P1
   # 统一接口（Week 3 插 exposure / hybrid 时不得改动其他任何代码）：
