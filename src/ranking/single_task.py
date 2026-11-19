@@ -11,7 +11,7 @@ Single-Task 是**参照点**，不是"预算内的一档"；MMoE / PLE / Selecti
 
 ## 结构
 
-    batch -> RankingEncoder（四个模型共用，见 features.py）-> x (308 维)
+    batch -> RankingEncoder（四个模型共用，见 features.py）-> x (323 维)
           -> MLP tower_hidden -> 1 个 logit
 
 共享机制作用在 x 之上，这里的"机制"就是"没有机制"：一个塔，一个任务。
@@ -53,6 +53,21 @@ from src.utils.seed import set_seed
 log = get_logger(__name__)
 
 
+def artifact_tag(prefix: str, protocol: str, seed: int, *, smoke: bool = False) -> str:
+    """单任务实验汇总产物名；variant 是命名契约的一维，不能靠调用处手抄。"""
+    if not prefix or any(c in prefix for c in ("/", "\\", " ")):
+        raise ValueError(f"非法 artifact prefix：{prefix!r}")
+    tag = f"{prefix}_{protocol}_seed{int(seed)}"
+    return tag + ("_smoke" if smoke else "")
+
+
+def checkpoint_tag(prefix: str, task: str, protocol: str, seed: int,
+                   *, smoke: bool = False) -> str:
+    """逐任务 checkpoint 名；与汇总产物共享同一 variant prefix。"""
+    tag = f"{prefix}_{task}_{protocol}_seed{int(seed)}"
+    return tag + ("_smoke" if smoke else "")
+
+
 class SingleTaskDNN(nn.Module):
     def __init__(self, data: RankingData, cfg: dict, task: str) -> None:
         super().__init__()
@@ -67,9 +82,14 @@ class SingleTaskDNN(nn.Module):
         return {self.task: self.tower(self.encoder(b)).squeeze(-1)}
 
 
-def main() -> int:
+def main(*, default_config: str = "configs/single_task.yaml",
+         artifact_prefix: str = "single_task",
+         model_name: str = "single_task",
+         expected_history_pooling: str = "masked_mean",
+         expected_din_normalization: str | None = None) -> int:
+    """运行五个彼此独立的单任务模型；DIN 复用入口但使用独立产物前缀。"""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/single_task.yaml")
+    ap.add_argument("--config", default=default_config)
     ap.add_argument("--protocol", default="main", choices=("main", "aux"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tasks", default=None, help="逗号分隔的简称子集，覆盖 config")
@@ -83,6 +103,20 @@ def main() -> int:
     a = ap.parse_args()
 
     cfg = load_config(a.config)
+    actual_pooling = str(require(cfg, "input").get("history_pooling", "masked_mean"))
+    if actual_pooling != expected_history_pooling:
+        raise ValueError(
+            f"{model_name} 入口要求 history_pooling={expected_history_pooling!r}，"
+            f"但 {a.config} 给出 {actual_pooling!r}。拒绝继续，避免错误产物覆盖正确结果。"
+        )
+    if expected_din_normalization is not None:
+        actual_norm = str(require(require(cfg, "input"), "din").get("normalization"))
+        if actual_norm != expected_din_normalization:
+            raise ValueError(
+                f"{model_name} 入口要求 DIN normalization="
+                f"{expected_din_normalization!r}，但 {a.config} 给出 {actual_norm!r}。"
+                "拒绝继续，避免不同 DIN 变体共用产物名。"
+            )
     proc = project_path(require(cfg, "data", "dataset", "processed_dir"))
     label_cols = require(cfg, "data", "labels", "tasks")
     shorts = [s.strip() for s in a.tasks.split(",")] if a.tasks else list(require(cfg, "tasks"))
@@ -91,7 +125,7 @@ def main() -> int:
         cfg["epochs"] = a.epochs
 
     smoke = any(v is not None for v in (a.epochs, a.limit_train, a.limit_eval))
-    tag = f"single_task_{a.protocol}_seed{a.seed}" + ("_smoke" if smoke else "")
+    tag = artifact_tag(artifact_prefix, a.protocol, a.seed, smoke=smoke)
     log.info("任务映射 %s -> %s%s", shorts, tasks, "（烟测）" if smoke else "")
 
     set_seed(a.seed)
@@ -127,8 +161,8 @@ def main() -> int:
         save_checkpoint(model, {"task": t, "seed": a.seed, "protocol": a.protocol,
                                 "checkpoint_rule": res["checkpoint_rule"],
                                 "input_fingerprint": fp},
-                        f"single_task_{t}_{a.protocol}_seed{a.seed}"
-                        + ("_smoke" if smoke else ""))
+                        checkpoint_tag(artifact_prefix, t, a.protocol, a.seed,
+                                       smoke=smoke))
         # 每个任务一落盘就写出：跑到第 4 个任务挂掉时，前 3 个的指标不能只留在内存里，
         # 否则只剩 checkpoint 而没有指标，被迫重跑。
         write_results(res, f"{tag}__{t}")
@@ -136,7 +170,7 @@ def main() -> int:
         gc.collect()
 
     combined = {
-        "tag": tag, "model": "single_task", "protocol": a.protocol, "seed": a.seed,
+        "tag": tag, "model": model_name, "protocol": a.protocol, "seed": a.seed,
         "tasks": tasks, "smoke": smoke,
         "checkpoint_rule": "fixed_epochs_last",
         # 训练协议要在**汇总**里也记全 —— 报告引的是这个文件，缺一项就等于没记录。

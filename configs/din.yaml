@@ -1,4 +1,43 @@
-# DIN-style attention (P2，默认不做)。
-enabled: false
-attention_hidden: [64, 32]
-max_history_len: 50
+# DIN-softmax target-aware history pooling + Single-Task DNN。
+#
+# 这是与 configs/single_task.yaml 的受控两臂对比：训练协议、五个任务、输入通道、
+# 32 维 hist_pool 输出和下游 MLP 逐字相同；唯一结构变化是 masked_mean -> DIN-style
+# target attention，另增加 query projection / attention MLP 的少量 dense 参数。
+# 预注册见 results/din_prediction.json。开发阶段只看 valid，不评 test。
+
+data_config: configs/data.yaml
+tasks: [click, long_view, like, follow, comment]
+embedding_dim: 32
+optimizer: adam
+lr: 0.001
+batch_size: 2048
+epochs: 1
+dropout: 0.0
+weight_decay: 1.0e-5
+eval_every_steps: 500
+seeds: [42, 43, 44]
+
+# 与现有 Single-Task 完全相同，防止把下游容量差异算成 attention 收益。
+tower_hidden: [256, 128, 64]
+
+input:
+  author_dim: 16
+  tag_dim: 8
+  cat_dim: 8
+  max_hist: 50
+  mask_oov_in_history: true
+  pair_features: true
+
+  # 旧 configs 不写此键时仍是 masked_mean，旧结果与 df312ebad132ea41 指纹保持不变。
+  history_pooling: din
+  din:
+    attention_hidden: [64, 32]
+    normalization: masked_softmax
+    # query 固定由 Encoder 构造：目标 ID（排序词表）+ 作者 + 标签池化 + 时长 + 年龄
+    # + 元数据 known flags。video_id_known 与目标是否落到 OOV embedding 完全等价，
+    # 不重复送进 attention。不能只用目标 ID：test 段 89.2% 为 OOV，否则 attention
+    # 会在这些候选之间静默退化成同一个 query。
+    #
+    # 权重对有效历史位置做 masked softmax。原始 DIN 不做 softmax；这里明确标为
+    # DIN-softmax，使输出尺度与 masked_mean 可比。hist_len 只能表达历史数量，不能补回
+    # 原始 DIN raw 权重和所包含的“候选相关激活强度”。

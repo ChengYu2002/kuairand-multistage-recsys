@@ -1,0 +1,69 @@
+{
+  "written_at": "2026-11-16，任何 DIN-raw 烟测或正式训练开始之前",
+  "git_head_before_worktree_changes": "d0392ad",
+  "purpose": "预注册 DIN-raw 与已完成 DIN-softmax 的单变量对比；检验原论文不归一化权重和所保留的候选相关兴趣强度，是否优于归一化 attention。跑完后不按结果修改主指标、门槛或任务范围。",
+  "contrast": {
+    "reference": "din_single_task_main_seed{42,43,44}：masked-softmax target-aware pooling（报告名称 DIN-softmax）",
+    "treatment": "din_raw_single_task_main_seed{42,43,44}：不做 softmax 的 raw weighted sum（报告名称 DIN-raw）",
+    "secondary_reference": "single_task_main_seed{42,43,44}：masked mean",
+    "tasks": [
+      "is_click",
+      "long_view",
+      "is_like",
+      "is_follow",
+      "is_comment"
+    ],
+    "seeds": [42, 43, 44],
+    "only_behavioral_change": "configs/din.yaml 与 configs/din_raw.yaml 只有 input.din.normalization 不同：masked_softmax -> raw；数据、query、local activation MLP、ReLU、输入通道、下游塔、优化器、batch、轮数、正则和固定轮末 checkpoint 全部相同。",
+    "development_split": "valid only；本轮不评 test",
+    "artifact_prefix": "din_raw_single_task"
+  },
+  "scope_boundary": {
+    "claim": "本轮恢复原论文不要求 attention 权重和为 1 的 pooling 语义。",
+    "not_claimed": "不是完整 DIN 复现：仍使用 ReLU 而非 Dice，仍使用普通 Adam weight decay 而非 Mini-batch Aware Regularization；query 也按 KuaiRand 的 ID/作者/标签/数值侧信息做了适配。",
+    "why_staged": "一次只改 normalization，避免 raw pooling、Dice 与 MBA 同时变化后无法定位收益来源。"
+  },
+  "module_survival_gate": {
+    "reason": "已完成的 DIN-softmax 三个 seed 在训练后均退化为均匀池化：attention 权重矩阵元素约为 1e-38，进入 float32 非正规数区间；其 L2 范数因平方下溢读作 0，位置权重极差也为 0。DIN-raw 若同样塌缩，其 AUC 只能解释为删除历史通道，不能解释为 raw 兴趣强度实验。",
+    "tracked_weight_matrices": [
+      "query_proj.weight",
+      "local_activation.0.weight",
+      "local_activation.2.weight",
+      "local_activation.4.weight"
+    ],
+    "minimum_parameter_norm_ratio_to_initial": 0.001,
+    "minimum_history_embedding_norm_ratio_to_initial": 0.001,
+    "minimum_p95_within_row_weight_spread_ratio_to_initial": 0.01,
+    "minimum_mean_abs_valid_weight_ratio_to_initial": 0.001,
+    "masked_mean_reference_pool_l2_p95_max": 0.05401233956217766,
+    "maximum_raw_pool_l2_p95_multiplier": 100.0,
+    "maximum_raw_pool_l2_p95": 5.401233956217766,
+    "scale_upper_bound_reason": "参考值是在同一固定 4096 行 valid 探针上、15 个 masked-mean Single-Task checkpoint 的历史池化 L2 p95 最大值；其中三个稀疏任务的 9 个 checkpoint 已塌缩为 0，因此上界取自仍存活的稠密任务最大值，而不是 15 次同质运行的波动范围。max_hist=50，raw sum 在单位权重下可自然达到 mean 的约 50 倍；100 倍上界再留一倍余量，只拦截有限但明显失控的数值爆炸，不作为调参或性能筛选条件。",
+    "decision": "存活门按任务判定，不按整个实验臂一票否决。某任务只有在三个 seed 的历史 embedding、attention 参数、位置分化、有效 raw 权重、结构与数值尺度全部通过时，才解释该任务的 AUC/GAUC/PCOC；失败任务在 summary 中保留原始数字和失败原因，但不产生‘raw 有效/无效’结论，也不阻断其他通过任务。各下界只用于抓近零死亡而非限制正常收敛。"
+  },
+  "primary_metric": {
+    "name": "valid AUC",
+    "effect": "逐任务、逐 seed 计算 DIN-raw - DIN-softmax，再对三个配对差值计算 mean 与 sample std。",
+    "bar": "方向性结论必须同时满足 |mean(delta)| / std(delta) >= 2.0 且 3/3 seeds 同号；不声称统计显著性。"
+  },
+  "secondary_metrics": [
+    "DIN-raw 相对 masked mean 的配对 AUC，帮助判断 raw 是否只恢复到基线或真正超过基线",
+    "GAUC 与 PCOC 并列报告，不作为本轮主判据",
+    "valid 曲线峰值位置和峰后变化，只作过拟合诊断，不改变 fixed_epochs_last 规则",
+    "raw attention 权重和、绝对值与输出范数，确认未静默退化为归一化 attention 或数值爆炸"
+  ],
+  "predictions": {
+    "dense_tasks": "若候选相关激活强度是 softmax 变体缺失的关键信号，is_click / long_view 至少一个任务的 raw-softmax delta AUC 应为正并通过 2.0 + 3/3 同号门槛。否则该解释不获支持。",
+    "sparse_tasks": "五任务全部运行，但事前认为 is_like / is_follow / is_comment 测量能力较低，不从单 seed 或 GAUC 正负号推导机制结论。",
+    "scale": "raw 输出允许随激活强度和有效历史数改变尺度；这是待检验机制的一部分，不在训练前人为归一回去。若数值不有限，或固定 valid 探针上的历史池化 L2 p95 超过事前固定上界 5.401233956217766，则实现/训练视为失败而非性能结论。"
+  },
+  "falsification": [
+    "is_click 与 long_view 的 raw-softmax delta AUC 均未通过 |mean|/std >= 2.0 且 3/3 同号：不宣称无 softmax 更好。",
+    "raw 权重在非空历史上仍恒定求和为 1，或复制同一有效历史位置不改变输出尺度：raw 实现失败，禁止训练。",
+    "训练后历史 embedding、attention 参数范数、位置权重分化或有效 raw 权重绝对值低于 module_survival_gate 的事前下界：对应任务判为上游或 attention 模块塌缩，不解释该任务的 AUC/GAUC/PCOC；其他通过任务仍可解释。",
+    "训练后固定 valid 探针上的 raw 历史池化 L2 p95 超过 5.401233956217766：对应任务判为有限数值爆炸，不解释该任务的 AUC/GAUC/PCOC。",
+    "masked 位置权重非零、全空历史输出非零或 NaN/Inf：实现失败，禁止训练。",
+    "DIN-softmax 既有 fingerprint 或输出因新增 raw 分支发生变化：旧结果失效，禁止训练。",
+    "DIN-raw 捷径扫描超过既有 0.15 阈值：先查 attention 路径，不用最终指标掩盖。"
+  ]
+}

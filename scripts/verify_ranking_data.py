@@ -85,6 +85,10 @@ SPLITS = ("train", "valid", "test")
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/data.yaml")
+    ap.add_argument(
+        "--encoder-config", default="configs/single_task.yaml",
+        help="H 段捷径扫描使用的 Encoder 配置；DIN 必须显式传 configs/din.yaml，"
+             "因为 attention 是一条新作用路径，不能沿用 masked-mean 的扫描结论。")
     ap.add_argument("--protocol", default="main", choices=("main", "aux"))
     ap.add_argument("--split", default="test", choices=SPLITS)
     ap.add_argument("--n", type=int, default=512, help="抽样行数")
@@ -272,7 +276,8 @@ def main() -> int:
 
     # ---------- H. 捷径扫描 ----------
     print("\n=== H. 捷径扫描（实测哪些键进了模型，再比 train/valid 强度）===")
-    enc_cfg = load_config("configs/single_task.yaml")
+    enc_cfg = load_config(a.encoder_config)
+    print(f"    Encoder 配置：{a.encoder_config}")
     ic = require(enc_cfg, "input")
     dl = {"max_hist": int(ic["max_hist"]), "mask_oov": bool(ic["mask_oov_in_history"])}
     dtr = RankingData(proc, p, "train", st, **dl)

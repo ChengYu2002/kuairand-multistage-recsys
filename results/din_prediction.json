@@ -1,0 +1,54 @@
+{
+  "written_at": "2026-11-16，任何 DIN 烟测或正式训练开始之前",
+  "git_head": "d0392ad",
+  "purpose": "预注册 masked mean 与 DIN-style target-aware history pooling 的受控对比；跑完后逐条对账，不按结果改主指标、阈值或任务范围。",
+  "contrast": {
+    "baseline": "single_task_main_seed{42,43,44}：历史视频 embedding 的 masked mean",
+    "treatment": "din_single_task_main_seed{42,43,44}：候选目标条件化的历史 attention",
+    "tasks": [
+      "is_click",
+      "long_view",
+      "is_like",
+      "is_follow",
+      "is_comment"
+    ],
+    "seeds": [42, 43, 44],
+    "controlled": "同一数据、时间切分、排序词表、历史词表、32 维 hist_pool 输出、323 维总输入、下游 MLP、优化器、batch、轮数、正则与固定轮末 checkpoint；主要变化是历史聚合函数，另增加 attention/query projection 的少量 dense 参数。",
+    "known_coupling": "DIN query 复用目标 item/author/tag embedding，因此这些目标侧 embedding 除原有 x 通道外，还会从 query projection 与 attention 路径获得梯度。该耦合是目标感知 attention 的组成部分，不是实现错误；因此若 DIN 获益，本轮只能归因于完整的 target-aware pooling 机制，不能进一步声称收益唯一来自历史位置重加权。DIN-detached 可作为后续独立消融，本轮不临时增加第三实验臂。",
+    "development_split": "valid only；架构与口径冻结前不评 test",
+    "artifact_prefix": "din_single_task"
+  },
+  "attention_definition": {
+    "name": "DIN-style target-aware history pooling（不声称逐字复现原论文）",
+    "history": "召回词表 hist_emb，PAD 与 OOV 延续现有 hist_mask 口径",
+    "query": "排序目标 ID embedding + author embedding + tag pooled embedding + duration + age + metadata known flags；video_id_known 与目标是否落到 OOV embedding 完全等价，不重复送入 attention。目标 ID 为 OOV 时仍由其余侧信息区分候选",
+    "interaction": "[h, q, h-q, h*q] -> MLP -> scalar",
+    "normalization": "对有效历史位置做 masked softmax；全空历史输出零向量",
+    "output": "32 维，替换原 hist_pool，不改变其余通道和下游塔输入维度"
+  },
+  "primary_metric": {
+    "name": "valid AUC",
+    "effect": "对每个任务先按 seed 计算 DIN - masked_mean，再对三个配对差值计算 mean 与 sample std",
+    "bar": "进入方向性结论必须同时满足 |mean(delta)| / std(delta) >= 2.0 且 3/3 seeds 同号；不打统计显著性标签。",
+    "reason": "现有排序实验里 AUC 的跨 seed 方向比 GAUC 稳；is_follow 的 valid GAUC 只有约 395 个可算用户且人均正样本约 3.7，测量能力不足。"
+  },
+  "secondary_metrics": [
+    "GAUC：逐任务并列报告，但不作为本轮主判据",
+    "PCOC：检查 attention 是否改善排序却破坏概率校准",
+    "dense 参数增量与训练时间：防止把额外计算量隐去",
+    "attention 诊断：候选敏感性、mask、全空历史与 OOV 目标侧信息",
+    "valid 曲线诊断：利用既有 eval_every_steps=500 记录，对比两臂峰值位置与峰后变化；只用于区分‘没有学到’和‘更早过拟合’，不改变 fixed_epochs_last 报告规则，也不作为本轮成败判据"
+  ],
+  "predictions": {
+    "dense_tasks": "is_click / long_view 最可能受益；预期至少一个任务的配对 delta AUC 为正并通过 2.0 + 3/3 同号门槛。若两个都未通过，核心假设视为未获支持。",
+    "sparse_tasks": "is_like / is_follow / is_comment 仍全部运行并报告；事前预期其效应更可能落入 seed 噪声，尤其不从 GAUC 的单次正负号推导机制结论。",
+    "mechanism": "同一用户历史面对不同候选时 attention 权重应变化；目标 ID 同为 OOV 时，不同作者/标签仍应产生不同权重，否则实现视为退化，训练指标不得解释。"
+  },
+  "falsification": [
+    "is_click 与 long_view 的配对 delta AUC 都未达到 |mean|/std >= 2.0 且 3/3 同号：不宣称 DIN 有效。",
+    "目标 ID 同为 OOV、侧信息不同的候选产生相同 attention：query 设计失败，正式训练结果作废。",
+    "masked 位置获得非零权重、全空历史产生非零或 NaN、旧 masked_mean 指纹/输出改变：实现失败，禁止训练。",
+    "DIN 变体的捷径扫描超过既有 0.15 阈值：先查新 attention 路径，不用指标掩盖。"
+  ],
+  "deferred_question": "若 Single-Task DIN 获得支持，下一阶段才比较多任务模型中的共享 DIN 与任务专属 DIN；本轮不把序列通道共享方式与历史聚合方式混成一个实验。"
+}

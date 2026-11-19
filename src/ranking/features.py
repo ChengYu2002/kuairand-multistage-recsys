@@ -36,7 +36,8 @@
 
 ## 通道清单（顺序即拼接顺序，改了指纹就变）
 
-    hist_pool     item_dim     历史 masked mean —— 用户看过什么（**召回词表**表）
+    hist_pool     item_dim     历史聚合（默认 masked mean；DIN 实验改为 target-aware
+                               attention），历史 ID 始终走**召回词表**
     item_id       item_dim     目标视频 ID（**排序词表**表，只由 train 曝光构建）。
                                测试段 89.2% 是 OOV，由 video_id_known 标注
     author        author_dim   作者（排序专用词表，test 覆盖 64%）
@@ -83,9 +84,110 @@ def masked_mean(emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     m = mask.unsqueeze(-1).to(emb.dtype)
     return (emb * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+
+
 # 历史中只平均有效视频
 # 标签中只平均有效标签
 # PAD 和被 mask 的历史 OOV 不参与
+
+
+class DINHistoryPool(nn.Module):
+    """候选目标条件化的历史聚合；支持受控比较两种权重语义。
+
+    历史向量 ``h`` 与由目标 ID / 作者 / 标签 / 数值 / known flags 拼出的 query ``q``
+    先投到同一维度，再用 ``[h, q, h-q, h*q]`` 计算逐位置相关性。
+
+    ``masked_softmax`` 是已经完成的 DIN-softmax 受控变体：输出与 masked mean 同尺度。
+    ``raw`` 对应原论文“不要求权重和为 1”的聚合语义，保留候选相关的激活强度。注意
+    ``hist_len`` 只能表达候选无关的历史数量，不能替代 raw 权重和所表达的候选相关强度。
+    两种模式仍使用 ReLU 且没有 MBA regularization，因此都不冒充完整论文复现。
+
+    全 mask 行不能直接对全 ``-inf`` 做 softmax（会产生 NaN）。实现先用有限极小值，
+    softmax 后再乘 mask 并重新归一；全空行因此严格输出零向量。
+    """
+
+    def __init__(
+        self,
+        hist_dim: int,
+        query_dim: int,
+        attention_hidden: list[int],
+        normalization: str = "masked_softmax",
+    ) -> None:
+        super().__init__()
+        if hist_dim <= 0 or query_dim <= 0:
+            raise ValueError(
+                f"DIN 维度必须为正，收到 hist={hist_dim}, query={query_dim}"
+            )
+        if not attention_hidden or any(int(h) <= 0 for h in attention_hidden):
+            raise ValueError(
+                f"DIN attention_hidden 必须是正整数列表，收到 {attention_hidden}"
+            )
+        self.hist_dim = int(hist_dim)
+        self.query_dim = int(query_dim)
+        self.attention_hidden = [int(h) for h in attention_hidden]
+        self.normalization = str(normalization)
+        if self.normalization not in {"masked_softmax", "raw"}:
+            raise ValueError(
+                "DIN normalization 只支持 'masked_softmax' / 'raw'，"
+                f"收到 {self.normalization!r}"
+            )
+        self.query_proj = nn.Linear(self.query_dim, self.hist_dim)
+        layers: list[nn.Module] = []
+        d = 4 * self.hist_dim
+        for h in self.attention_hidden:
+            layers += [nn.Linear(d, h), nn.ReLU()]
+            d = h
+        layers.append(nn.Linear(d, 1))
+        self.local_activation = nn.Sequential(*layers)
+
+    def fingerprint(self) -> dict:
+        return {
+            "kind": "din_style_target_attention",
+            "hist_dim": self.hist_dim,
+            "query_dim": self.query_dim,
+            "attention_hidden": self.attention_hidden,
+            "interaction": "[h,q,h-q,h*q]",
+            "normalization": self.normalization,
+            "empty_history": "zero_vector",
+        }
+
+    def forward(
+        self,
+        history: torch.Tensor,
+        mask: torch.Tensor,
+        query: torch.Tensor,
+        *,
+        return_weights: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if history.ndim != 3 or history.shape[-1] != self.hist_dim:
+            raise ValueError(
+                f"history 应为 (B,L,{self.hist_dim})，收到 {tuple(history.shape)}"
+            )
+        if mask.shape != history.shape[:2]:
+            raise ValueError(
+                f"mask 应为 {tuple(history.shape[:2])}，收到 {tuple(mask.shape)}"
+            )
+        if query.ndim != 2 or query.shape != (history.shape[0], self.query_dim):
+            raise ValueError(
+                f"query 应为 ({history.shape[0]},{self.query_dim})，收到 {tuple(query.shape)}"
+            )
+
+        q = self.query_proj(query).unsqueeze(1).expand(-1, history.shape[1], -1)
+        interaction = torch.cat([history, q, history - q, history * q], dim=-1)
+        score = self.local_activation(interaction).squeeze(-1)
+        valid = mask.to(torch.bool)
+        if self.normalization == "masked_softmax":
+            score = score.masked_fill(~valid, torch.finfo(score.dtype).min)
+            weights = torch.softmax(score, dim=1) * valid.to(score.dtype)
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        else:
+            # 原始 DIN 放松 sum(weights)=1 的约束。mask 后直接加权求和，让权重总和
+            # 保留“当前候选激活了多少历史兴趣”的强度；全空历史自然得到严格零向量。
+            weights = score * valid.to(score.dtype)
+        pooled = torch.bmm(weights.unsqueeze(1), history).squeeze(1)
+        if return_weights:
+            return pooled, weights
+        return pooled
 
 
 class RankingEncoder(nn.Module):
@@ -104,14 +206,22 @@ class RankingEncoder(nn.Module):
         # item_id_channel=False：整条目标 ID 通道（含 video_id_known）不进 x，用于消融。
         self.id_dropout = float(ic.get("id_dropout", 0.0))
         if not 0.0 <= self.id_dropout < 1.0:
-            raise ValueError(f"input.id_dropout 必须在 [0,1) 内，收到 {self.id_dropout}")
+            raise ValueError(
+                f"input.id_dropout 必须在 [0,1) 内，收到 {self.id_dropout}"
+            )
         self.use_item_id = bool(ic.get("item_id_channel", True))
+        self.history_pooling = str(ic.get("history_pooling", "masked_mean"))
+        if self.history_pooling not in {"masked_mean", "din"}:
+            raise ValueError(
+                "input.history_pooling 只支持 'masked_mean' / 'din'，"
+                f"收到 {self.history_pooling!r}"
+            )
         self.author_dim = int(ic["author_dim"])
         self.tag_dim = int(ic["tag_dim"])
         cat_dim = int(ic["cat_dim"])
 
         # 两张表：历史走召回词表，目标走排序词表（理由见模块 docstring 的 P0 一节）
-        n_hist = inner.item_tags.shape[0]           # 召回 video 词表行数
+        n_hist = inner.item_tags.shape[0]  # 召回 video 词表行数
         self.hist_emb = nn.Embedding(n_hist, item_dim, padding_idx=0)
         # hist_emb：历史视频，使用召回词表
         self.item_emb = nn.Embedding(st.n_videos_vocab, item_dim, padding_idx=0)
@@ -119,12 +229,22 @@ class RankingEncoder(nn.Module):
         self.author_emb = nn.Embedding(st.n_authors, self.author_dim, padding_idx=0)
         self.tag_emb = nn.Embedding(st.n_tags_vocab, self.tag_dim, padding_idx=0)
         self.cat_emb = nn.ModuleList(
-            [nn.Embedding(c, min(cat_dim, max(2, c // 2))) for c in inner.user_static_cat_sizes]
+            [
+                nn.Embedding(c, min(cat_dim, max(2, c // 2)))
+                for c in inner.user_static_cat_sizes
+            ]
         )
         self.tab_emb = nn.Embedding(16, 4)
         self.hour_emb = nn.Embedding(24, 4)
-        for e in (self.hist_emb, self.item_emb, self.author_emb, self.tag_emb, *self.cat_emb,
-                  self.tab_emb, self.hour_emb):
+        for e in (
+            self.hist_emb,
+            self.item_emb,
+            self.author_emb,
+            self.tag_emb,
+            *self.cat_emb,
+            self.tab_emb,
+            self.hour_emb,
+        ):
             nn.init.normal_(e.weight, std=0.01)
             if e.padding_idx is not None:
                 with torch.no_grad():
@@ -133,9 +253,11 @@ class RankingEncoder(nn.Module):
         # 装载器口径（max_hist / mask_oov_in_history）必须进指纹：它们改了 x 的含义，
         # 而 config 里写了却没接线的 bug 不会报错，只会让 YAML 变成装饰。
         self.data_params = dict(data.params)
-        want = {"max_hist": int(ic["max_hist"]),
-                "mask_oov_in_history": bool(ic["mask_oov_in_history"]),
-                "pair_features": bool(ic["pair_features"])}
+        want = {
+            "max_hist": int(ic["max_hist"]),
+            "mask_oov_in_history": bool(ic["mask_oov_in_history"]),
+            "pair_features": bool(ic["pair_features"]),
+        }
         if self.data_params != want:
             raise ValueError(
                 f"装载器口径 {self.data_params} 与 config input 段 {want} 不一致 —— "
@@ -150,8 +272,47 @@ class RankingEncoder(nn.Module):
         # 顺序即拼接顺序。写成表是为了 fingerprint 能把它序列化。
         # item_id 通道关掉时，video_id_known 也一并去掉 —— 没有 ID 向量的话这个标志
         # 只剩「这视频 train 期见过吗」，而它恰是 train/valid 强度差最大的通道（0.1174）。
-        self.flag_keys = tuple(FLAG_KEYS) if self.use_item_id else tuple(
-            k for k in FLAG_KEYS if k != "video_id_known")
+        self.flag_keys = (
+            tuple(FLAG_KEYS)
+            if self.use_item_id
+            else tuple(k for k in FLAG_KEYS if k != "video_id_known")
+        )
+        # DIN query 不只用目标 ID：test 段目标 ID 覆盖率只有 10.8%，只用它会让 89.2%
+        # 的候选共用 OOV query，attention 在候选之间静默退化。作者 / 标签 / 时长 / 年龄
+        # 在推荐发生前已存在，known flags 让模型区分“数值为 0”和“该字段缺失”。
+        self.din: DINHistoryPool | None = None
+        self.din_query_fields: tuple[str, ...] = ()
+        self.din_query_flag_keys: tuple[str, ...] = ()
+        if self.history_pooling == "din":
+            dc = ic.get("din")
+            if not isinstance(dc, dict):
+                raise ValueError("history_pooling='din' 时必须提供 input.din 配置段")
+            # video_id_known 与 item_idx 是否为 OOV 完全等价，而 item_vec 已经进 query；
+            # 再放一次只会给其轻微热度漂移开第二条路径。其余 flags 仍用于区分元数据缺失。
+            self.din_query_flag_keys = tuple(
+                k for k in self.flag_keys if k != "video_id_known"
+            )
+            self.din_query_fields = (
+                *(("item_id",) if self.use_item_id else ()),
+                "author",
+                "tag_pool",
+                "duration",
+                "age",
+                "known_flags",
+            )
+            query_dim = (
+                (item_dim if self.use_item_id else 0)
+                + self.author_dim
+                + self.tag_dim
+                + 2
+                + len(self.din_query_flag_keys)
+            )
+            self.din = DINHistoryPool(
+                item_dim,
+                query_dim,
+                [int(h) for h in dc.get("attention_hidden", [])],
+                normalization=str(dc.get("normalization", "masked_softmax")),
+            )
         # 323 维输入的目录
         self.channels: list[tuple[str, int]] = [
             ("hist_pool", item_dim),
@@ -175,10 +336,12 @@ class RankingEncoder(nn.Module):
         body = {
             "channels": self.channels,
             "out_dim": self.out_dim,
-            "vocabs": {"hist": self.hist_emb.num_embeddings,
-                       "item": self.item_emb.num_embeddings,
-                       "author": self.author_emb.num_embeddings,
-                       "tag": self.tag_emb.num_embeddings},
+            "vocabs": {
+                "hist": self.hist_emb.num_embeddings,
+                "item": self.item_emb.num_embeddings,
+                "author": self.author_emb.num_embeddings,
+                "tag": self.tag_emb.num_embeddings,
+            },
             "cat_sizes": [e.num_embeddings for e in self.cat_emb],
             "flags": list(self.flag_keys),
             "data_params": self.data_params,
@@ -187,41 +350,111 @@ class RankingEncoder(nn.Module):
             "id_dropout": self.id_dropout,
             "item_id_channel": self.use_item_id,
         }
+        # masked_mean 是历史正式结果的既有口径。默认路径不新增字段，确保旧配置的
+        # fingerprint（df312ebad132ea41）逐位不变；DIN 才显式写入新结构。
+        if self.din is not None:
+            body["history_pooling"] = self.history_pooling
+            body["din"] = {
+                **self.din.fingerprint(),
+                "query_fields": list(self.din_query_fields),
+                "query_known_flags": list(self.din_query_flag_keys),
+            }
         h = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
         return {"sha": h, **body}
 
-    def forward(self, b: dict) -> torch.Tensor:
+    def _target_embeddings(
+        self, b: dict
+    ) -> tuple[
+        dict[str, torch.Tensor], torch.Tensor | None, torch.Tensor, torch.Tensor
+    ]:
+        """目标侧 embedding 只查一次；ID dropout 同时服务主通道与 DIN query。"""
         flags = {k: b[k] for k in self.flag_keys}
-        item_channel = []
+        item_vec = None
         if self.use_item_id:
-            idx = b["item_idx"]                        # 排序词表行号，不是召回的
+            idx = b["item_idx"]  # 排序词表行号，不是召回的
             if self.training and self.id_dropout > 0:
                 drop = torch.rand(idx.shape, device=idx.device) < self.id_dropout
                 idx = torch.where(drop, torch.full_like(idx, OOV), idx)
                 if "video_id_known" in flags:
                     flags["video_id_known"] = torch.where(
-                        drop, torch.zeros_like(flags["video_id_known"]),
-                        flags["video_id_known"])
-            item_channel = [self.item_emb(idx)]
+                        drop,
+                        torch.zeros_like(flags["video_id_known"]),
+                        flags["video_id_known"],
+                    )
+            item_vec = self.item_emb(idx)
+        author_vec = self.author_emb(b["author"])
+        tag_vec = masked_mean(self.tag_emb(b["tags"]), b["tag_mask"])
+        return flags, item_vec, author_vec, tag_vec
+
+    def _history_pool(
+        self,
+        b: dict,
+        flags: dict[str, torch.Tensor],
+        item_vec: torch.Tensor | None,
+        author_vec: torch.Tensor,
+        tag_vec: torch.Tensor,
+        *,
+        return_weights: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        history = self.hist_emb(b["hist"])
+        if self.din is None:
+            if return_weights:
+                raise ValueError("masked_mean 没有 attention weights")
+            return masked_mean(history, b["hist_mask"])
+        query_parts = []
+        if item_vec is not None:
+            query_parts.append(item_vec)
+        query_parts.extend(
+            [
+                author_vec,
+                tag_vec,
+                b["duration"].unsqueeze(-1),
+                b["age"].unsqueeze(-1),
+                torch.stack([flags[k] for k in self.din_query_flag_keys], dim=-1),
+            ]
+        )
+        return self.din(
+            history,
+            b["hist_mask"],
+            torch.cat(query_parts, dim=-1),
+            return_weights=return_weights,
+        )
+
+    def attention_weights(self, b: dict) -> torch.Tensor:
+        """返回 DIN 权重供验算/诊断；正式 forward 仍只返回统一的 x。"""
+        if self.din is None:
+            raise ValueError("当前编码器使用 masked_mean，没有 attention weights")
+        flags, item_vec, author_vec, tag_vec = self._target_embeddings(b)
+        _, weights = self._history_pool(
+            b, flags, item_vec, author_vec, tag_vec, return_weights=True
+        )
+        return weights
+
+    def forward(self, b: dict) -> torch.Tensor:
+        flags, item_vec, author_vec, tag_vec = self._target_embeddings(b)
+        item_channel = [item_vec] if item_vec is not None else []
+        hist_pool = self._history_pool(b, flags, item_vec, author_vec, tag_vec)
         x = torch.cat(
             [
                 # 历史 ID 转成 embedding
-                masked_mean(self.hist_emb(b["hist"]), b["hist_mask"]),
+                hist_pool,
                 *item_channel,
-                self.author_emb(b["author"]),
-                masked_mean(self.tag_emb(b["tags"]), b["tag_mask"]),
+                author_vec,
+                tag_vec,
                 b["user_t1"],
                 b["item_t1"],
                 *([b["pair"]] if self.n_pair else []),
                 b["user_static_num"],
-                torch.cat([e(b["user_static_cat"][:, i]) for i, e in enumerate(self.cat_emb)],
-                          dim=-1),
+                torch.cat(
+                    [e(b["user_static_cat"][:, i]) for i, e in enumerate(self.cat_emb)],
+                    dim=-1,
+                ),
                 self.tab_emb(b["tab"]),
                 self.hour_emb(b["hour"]),
                 torch.stack(
                     [
-                        b["duration"],                      # 已按 train 统计标准化
-                        b["age"],                           # 已 log1p
+                        b["duration"],  # 已按 train 统计标准化
+                        b["age"],  # 已 log1p
                         # 长度是重尾的（训练均值 49.7/50，测试只有 8.5/50），取 log1p
                         torch.log1p(b["hist_len"]),
                         b["tag_len"],
@@ -239,8 +472,9 @@ class RankingEncoder(nn.Module):
         return x
 
 
-def mlp(in_dim: int, hidden: list[int], out_dim: int | None = None,
-        dropout: float = 0.0) -> nn.Sequential:
+def mlp(
+    in_dim: int, hidden: list[int], out_dim: int | None = None, dropout: float = 0.0
+) -> nn.Sequential:
     """ReLU MLP。最后一层不接激活；out_dim 给定时再接一个线性头。
 
     与 src/retrieval/item_tower.mlp 分开是因为排序要 dropout 与可选输出头，
@@ -263,17 +497,23 @@ def mlp(in_dim: int, hidden: list[int], out_dim: int | None = None,
 
 def count_params(m: nn.Module) -> dict:
     """按 embedding / 其余 分别计数（§25.1 的 parameter budget 要分段报）。"""
-    emb = sum(p.numel() for mod in m.modules() if isinstance(mod, nn.Embedding)
-              for p in mod.parameters())
+    emb = sum(
+        p.numel()
+        for mod in m.modules()
+        if isinstance(mod, nn.Embedding)
+        for p in mod.parameters()
+    )
     total = sum(p.numel() for p in m.parameters())
     return {"embedding": emb, "dense": total - emb, "total": total}
 
 
 # 参数分段的归类前缀。§25.1 要求 MMoE / PLE / Selective 之间参数预算可比，而它们的结构
 # 完全不同（共享专家 / 分层专家 / shared+task_specific 维度），只报一个 dense 总数没法比。
-_PARAM_GROUPS = (("expert", ("experts.", "shared_experts.", "task_experts.")),
-                 ("gate", ("gates.",)),
-                 ("tower", ("towers.", "tower.")))
+_PARAM_GROUPS = (
+    ("expert", ("experts.", "shared_experts.", "task_experts.")),
+    ("gate", ("gates.",)),
+    ("tower", ("towers.", "tower.")),
+)
 
 
 def count_params_grouped(m: nn.Module) -> dict:
@@ -282,8 +522,12 @@ def count_params_grouped(m: nn.Module) -> dict:
     归类按参数名前缀。未命中任何前缀的落进 other（Single-Task 的整个塔叫 tower，
     所以它会落在 tower 段；编码器里的非 embedding 参数落 other）。
     """
-    emb_ids = {id(p) for mod in m.modules() if isinstance(mod, nn.Embedding)
-               for p in mod.parameters()}
+    emb_ids = {
+        id(p)
+        for mod in m.modules()
+        if isinstance(mod, nn.Embedding)
+        for p in mod.parameters()
+    }
     out = dict.fromkeys(("embedding", "expert", "gate", "tower", "other"), 0)
     for name, p in m.named_parameters():
         if id(p) in emb_ids:

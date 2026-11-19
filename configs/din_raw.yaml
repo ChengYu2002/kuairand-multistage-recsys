@@ -1,0 +1,35 @@
+# DIN-raw target-aware history pooling + Single-Task DNN。
+#
+# 与 configs/din.yaml 的逐字受控对比：唯一行为差异是 attention normalization 从
+# masked_softmax 改为 raw。raw 不强制权重和为 1，对应原始 DIN 保留候选相关兴趣强度的
+# 聚合语义。此配置仍沿用 ReLU 与普通 Adam weight decay，没有实现 Dice / MBA，因而只称
+# “原论文 attention pooling 语义”，不声称完整复现论文。
+
+data_config: configs/data.yaml
+tasks: [click, long_view, like, follow, comment]
+embedding_dim: 32
+optimizer: adam
+lr: 0.001
+batch_size: 2048
+epochs: 1
+dropout: 0.0
+weight_decay: 1.0e-5
+eval_every_steps: 500
+seeds: [42, 43, 44]
+
+tower_hidden: [256, 128, 64]
+
+input:
+  author_dim: 16
+  tag_dim: 8
+  cat_dim: 8
+  max_hist: 50
+  mask_oov_in_history: true
+  pair_features: true
+
+  history_pooling: din
+  din:
+    attention_hidden: [64, 32]
+    normalization: raw
+    # query 与 DIN-softmax 完全相同：目标 ID（排序词表）+ 作者 + 标签池化 + 时长 +
+    # 年龄 + 元数据 known flags；video_id_known 不重复进入 attention。

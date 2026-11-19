@@ -149,6 +149,77 @@ def evaluate_split(model: nn.Module, data: RankingData, tasks: tuple[str, ...]) 
     return res
 
 
+WD_GROUP_PATTERNS = {
+    # 实测：扁平 weight_decay=1e-5 会让 attention 在两个任务上都塌缩到 1e-38，并让
+    # 稀疏任务的 hist_emb 整张表死掉（轨迹见 results/din_collapse_trace_*.json）。
+    # 这两个模块的失效条件不同，所以分组按模块给，而不是按 dense / embedding 给。
+    "attention": ("encoder.din.",),
+    "history_embedding": ("encoder.hist_emb.",),
+}
+
+
+def build_optimizer(model: nn.Module, cfg: dict) -> tuple[torch.optim.Optimizer, dict]:
+    """构造 Adam，并返回实际生效的 weight decay 口径。
+
+    不写 ``weight_decay_groups`` 时**逐字沿用**原来的扁平调用，旧实验因此不受影响；
+    写了才分组。分组必须互不重叠且完整覆盖模型参数，否则直接报错 —— 漏掉一组参数
+    不会崩，只会让某些参数悄悄用错正则，而指标照样出得来。
+    """
+    lr = float(cfg["lr"])
+    wd = float(cfg.get("weight_decay", 0.0))
+    if cfg.get("optimizer", "adam") != "adam":
+        raise NotImplementedError(f"optimizer 目前只支持 adam，收到 {cfg.get('optimizer')!r}")
+
+    groups = cfg.get("weight_decay_groups")
+    if not groups:
+        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd), {
+            "mode": "flat",
+            "default": wd,
+            "groups": {},
+        }
+    if not isinstance(groups, dict):
+        raise TypeError(f"weight_decay_groups 必须是字典，收到 {type(groups).__name__}")
+    unknown = set(groups) - set(WD_GROUP_PATTERNS)
+    if unknown:
+        raise ValueError(
+            f"未知的 weight_decay_groups 分组 {sorted(unknown)}；"
+            f"可用分组：{sorted(WD_GROUP_PATTERNS)}"
+        )
+
+    named = list(model.named_parameters())
+    assigned: dict[str, str] = {}
+    for group_name in groups:
+        prefixes = WD_GROUP_PATTERNS[group_name]
+        hit = [n for n, _ in named if any(p in n for p in prefixes)]
+        if not hit:
+            raise ValueError(
+                f"weight_decay_groups 写了 {group_name!r}，但模型里没有匹配 "
+                f"{prefixes} 的参数。配置写了却没接线等于没分组。"
+            )
+        for n in hit:
+            if n in assigned:
+                raise AssertionError(f"参数 {n} 同时落进 {assigned[n]} 和 {group_name}")
+            assigned[n] = group_name
+
+    buckets: dict[str, list[nn.Parameter]] = {g: [] for g in groups}
+    default_bucket: list[nn.Parameter] = []
+    for n, p in named:
+        (buckets[assigned[n]] if n in assigned else default_bucket).append(p)
+    covered = sum(len(v) for v in buckets.values()) + len(default_bucket)
+    if covered != len(named):
+        raise AssertionError(f"参数分组未完整覆盖模型：{covered} != {len(named)}")
+
+    param_groups = [{"params": default_bucket, "weight_decay": wd}]
+    spec = {"mode": "grouped", "default": wd, "groups": {}}
+    for g, params in buckets.items():
+        g_wd = float(groups[g])
+        if g_wd < 0.0:
+            raise ValueError(f"weight_decay_groups[{g}] 必须非负，收到 {g_wd}")
+        param_groups.append({"params": params, "weight_decay": g_wd})
+        spec["groups"][g] = {"weight_decay": g_wd, "n_tensors": len(params)}
+    return torch.optim.Adam(param_groups, lr=lr), spec
+
+
 def train(model: nn.Module, tasks: tuple[str, ...], tr: RankingData, va: RankingData,
           te: RankingData | None, cfg: dict, seed: int, tag: str,
           fingerprint: dict, eval_test: bool = False) -> dict:
@@ -163,9 +234,7 @@ def train(model: nn.Module, tasks: tuple[str, ...], tr: RankingData, va: Ranking
     lr = float(cfg["lr"])
     wd = float(cfg.get("weight_decay", 0.0))
     eval_every = int(cfg.get("eval_every_steps", 0))
-    if cfg.get("optimizer", "adam") != "adam":
-        raise NotImplementedError(f"optimizer 目前只支持 adam，收到 {cfg.get('optimizer')!r}")
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    opt, wd_spec = build_optimizer(model, cfg)
     params = count_params(model)
     steps = -(-len(tr) // bs)
     log.info("%s | 任务 %s | %d 轮 x %s 批（bs=%d）| 参数 embedding %s + dense %s",
@@ -232,6 +301,9 @@ def train(model: nn.Module, tasks: tuple[str, ...], tr: RankingData, va: Ranking
     out = {
         "tag": tag, "seed": seed, "tasks": list(tasks),
         "epochs": epochs, "batch_size": bs, "lr": lr, "weight_decay": wd,
+        # 正则口径必须进产物：分组 weight decay 改变的是哪些模块能活下来，
+        # 而它不改变任何维度或指纹，光看 fingerprint 分辨不出两次运行的协议不同。
+        "weight_decay_spec": wd_spec,
         "dropout": float(cfg.get("dropout", 0.0)), "eval_every_steps": eval_every,
         "steps_per_epoch": steps,
         "checkpoint_rule": "fixed_epochs_last",   # 不挑最佳轮：理由见模块 docstring
